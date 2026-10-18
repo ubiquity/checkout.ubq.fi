@@ -18,11 +18,12 @@
     },
   ],
   "secrets": {
-    "required": ["CHECKOUT_KV_SERVICE_TOKEN"],
+    "required": ["CHECKOUT_KV_SERVICE_TOKEN", "CHECKOUT_ALCHEMY_WEBHOOK_KEYS"],
   },
-  "triggers": {
-    "crons": ["* * * * *"],
+  "durable_objects": {
+    "bindings": [{ "name": "CHECKOUT_SCHEDULER", "class_name": "CheckoutScheduler" }],
   },
+  "migrations": [{ "tag": "checkout-events-v1", "new_sqlite_classes": ["CheckoutScheduler"] }],
   "observability": {
     "enabled": true,
     "logs": {
@@ -38,8 +39,8 @@
       "name": "checkout-ubq-fi-candidate",
       "workers_dev": true,
       "routes": [],
-      "triggers": {
-        "crons": [],
+      "durable_objects": {
+        "bindings": [{ "name": "CHECKOUT_SCHEDULER", "class_name": "CheckoutScheduler" }],
       },
       "services": [
         {
@@ -48,7 +49,7 @@
         },
       ],
       "secrets": {
-        "required": ["CHECKOUT_KV_SERVICE_TOKEN"],
+        "required": ["CHECKOUT_KV_SERVICE_TOKEN", "CHECKOUT_ALCHEMY_WEBHOOK_KEYS"],
       },
       "version_metadata": {
         "binding": "UOS_VERSION",

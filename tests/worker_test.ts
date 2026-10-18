@@ -21,6 +21,10 @@ test("real workerd exercises the production Worker with isolated services", asyn
       !script.includes('from "bun:') && !script.includes('from "node:tls"'),
       "Bun-only modules must not enter the Worker bundle",
     );
+    ok(
+      !script.includes("HarnessCheckoutScheduler"),
+      "harness-only RPC helpers entered production bundle",
+    );
     // Miniflare's CLI/control plane requires supported Node; app/runtime tests stay Bun.
     const harness = await Bun.build({
       entrypoints: ["tests/worker_harness.ts"],

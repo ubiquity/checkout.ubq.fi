@@ -3,6 +3,7 @@ import {
   normalizeTransactionHash,
   type SupportedChainId,
 } from "./payment_types.ts";
+import { collectRpcBatchOutcomes } from "./rpc_batch.ts";
 
 export const RPC_ORIGIN = "https://rpc.ubq.fi";
 export const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -20,8 +21,17 @@ export type JsonRpcBatchItem = {
   error?: { code?: unknown; message?: unknown; data?: unknown };
 };
 
+export type RpcBatchLimits = {
+  maximumRequestBytes: number;
+  maximumResponseBytes: number;
+};
+
 export interface RpcClient {
-  batch(chainId: SupportedChainId, calls: readonly JsonRpcCall[]): Promise<JsonRpcBatchItem[]>;
+  batch(
+    chainId: SupportedChainId,
+    calls: readonly JsonRpcCall[],
+    limits?: RpcBatchLimits,
+  ): Promise<JsonRpcBatchItem[]>;
 }
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
@@ -32,6 +42,7 @@ export class HttpRpcClient implements RpcClient {
   async batch(
     chainId: SupportedChainId,
     calls: readonly JsonRpcCall[],
+    limits?: RpcBatchLimits,
   ): Promise<JsonRpcBatchItem[]> {
     if (calls.length === 0) throw new RpcError("rpc_batch_empty");
     const body = calls.map((call) => ({
@@ -40,21 +51,31 @@ export class HttpRpcClient implements RpcClient {
       method: call.method,
       params: call.params,
     }));
+    const serialized = JSON.stringify(body);
+    if (limits && new TextEncoder().encode(serialized).byteLength > limits.maximumRequestBytes) {
+      throw new RpcError("rpc_request_too_large");
+    }
     let response: Response;
     try {
       response = await this.fetcher(`${RPC_ORIGIN}/${chainId}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
+        body: serialized,
       });
     } catch (error) {
       throw new RpcError("rpc_transport_failed", error);
     }
-    if (!response.ok) throw new RpcError(`rpc_http_${response.status}`);
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new RpcError(`rpc_http_${response.status}`);
+    }
     let parsed: unknown;
     try {
-      parsed = await response.json();
+      parsed = limits
+        ? await boundedRpcJson(response, limits.maximumResponseBytes)
+        : await response.json();
     } catch (error) {
+      if (error instanceof RpcError) throw error;
       throw new RpcError("rpc_invalid_json", error);
     }
     if (!Array.isArray(parsed)) throw new RpcError("rpc_batch_response_required");
@@ -132,15 +153,7 @@ export async function chainHeads(
     method: "eth_getBlockByNumber",
     params: [id, false],
   }));
-  const results = responseMap(await client.batch(chainId, calls), calls);
-  const latest = parseBlock(results.get("latest"), "latest");
-  const safe = parseOptionalBlock(results.get("safe"), "safe");
-  const finalized = parseOptionalBlock(results.get("finalized"), "finalized");
-  return validateChainHeads({
-    latestBlock: latest.number,
-    safeBlock: safe?.number ?? null,
-    finalizedBlock: finalized?.number ?? null,
-  });
+  return canonicalHeads(await canonicalResults(client, chainId, calls));
 }
 
 export async function discoverTransferLogs(
@@ -169,8 +182,24 @@ export async function discoverTransferLogs(
     },
   ];
   const results = responseMap(await client.batch(chainId, calls), calls);
-  const rawLogs = results.get("transfer_logs");
+  return parseTransferLogs(results.get("transfer_logs"), tokenAddress, recipientAddress);
+}
+
+export function parseTransferLogs(
+  rawLogs: unknown,
+  tokenAddressInput: string,
+  recipientAddressInput: string,
+  range?: { fromBlock: bigint; toBlock: bigint },
+): DiscoveredTransferLog[] {
+  const tokenAddress = normalizeAddress(tokenAddressInput);
+  const recipientAddress = normalizeAddress(recipientAddressInput);
   if (!Array.isArray(rawLogs)) throw new RpcError("rpc_transfer_logs_array_required");
+  if (
+    range &&
+    rawLogs.some((value) => !value || typeof value !== "object" || Array.isArray(value))
+  ) {
+    throw new RpcError("rpc_transfer_logs_invalid_item");
+  }
   return rawLogs
     .filter(
       (value) =>
@@ -197,10 +226,14 @@ export async function discoverTransferLogs(
       if (discoveredRecipient !== recipientAddress) {
         throw new RpcError("rpc_transfer_log_recipient_mismatch");
       }
+      const blockNumber = parseQuantity(log.blockNumber, "invalid_log_block_number");
+      if (range && (blockNumber < range.fromBlock || blockNumber > range.toBlock)) {
+        throw new RpcError("rpc_transfer_log_outside_range");
+      }
       return {
         transactionHash: hexHash(log.transactionHash, "invalid_log_transaction_hash"),
         logIndex: Number(logIndex),
-        blockNumber: parseQuantity(log.blockNumber, "invalid_log_block_number"),
+        blockNumber,
         blockHash: hexHash(log.blockHash, "invalid_log_block_hash"),
         tokenAddress,
         payerAddress: topicAddress(topics[1], "invalid_transfer_payer"),
@@ -268,8 +301,8 @@ export async function verifyTransferBatch(
     },
   ];
 
-  // All canonical evidence and provider heads deliberately share this one batch/upstream request.
-  const results = responseMap(await client.batch(chainId, calls), calls);
+  // Preserve essential successes when an optional head fails; retry only failed head IDs once.
+  const results = await canonicalResults(client, chainId, calls);
   const eventBlock = parseBlock(results.get("event_block"), "event_block");
   if (
     previouslyVerifiedBlockHash !== undefined &&
@@ -348,14 +381,8 @@ export async function verifyTransferBatch(
     throw new RpcVerificationError("wrong_transfer_amount");
   }
 
-  const latest = parseBlock(results.get("latest"), "latest");
-  const safe = parseOptionalBlock(results.get("safe"), "safe");
-  const finalized = parseOptionalBlock(results.get("finalized"), "finalized");
-  const heads = validateChainHeads({
-    latestBlock: latest.number,
-    safeBlock: safe?.number ?? null,
-    finalizedBlock: finalized?.number ?? null,
-  });
+  const heads = canonicalHeads(results);
+  if (heads.latestBlock < receiptBlockNumber) throw new RpcError("rpc_incoherent_chain_heads");
   return {
     transactionHash,
     logIndex,
@@ -370,15 +397,49 @@ export async function verifyTransferBatch(
   };
 }
 
-function validateChainHeads(heads: ChainHeads): ChainHeads {
-  if (
-    (heads.safeBlock !== null && heads.safeBlock > heads.latestBlock) ||
-    (heads.finalizedBlock !== null &&
-      (heads.safeBlock === null || heads.finalizedBlock > heads.safeBlock))
-  ) {
-    throw new RpcError("rpc_incoherent_chain_heads");
+async function canonicalResults(
+  client: RpcClient,
+  chainId: SupportedChainId,
+  calls: readonly JsonRpcCall[],
+): Promise<Map<string, unknown>> {
+  const first = collectRpcBatchOutcomes(calls, await client.batch(chainId, calls));
+  const results = new Map<string, unknown>();
+  for (const outcome of first.outcomes) {
+    if (outcome.status === "success") results.set(outcome.id, outcome.result);
+    else if (!["latest", "safe", "finalized"].includes(outcome.id))
+      throw new RpcError(`rpc_${outcome.reason}:${outcome.id}`);
   }
-  return heads;
+  const failedHeads = calls.filter((call) => !results.has(call.id));
+  if (failedHeads.length) {
+    try {
+      const retry = collectRpcBatchOutcomes(failedHeads, await client.batch(chainId, failedHeads));
+      for (const outcome of retry.outcomes)
+        if (outcome.status === "success") results.set(outcome.id, outcome.result);
+    } catch (error) {
+      if (!(error instanceof RpcError)) throw error;
+      // A failed optional retry cannot discard an already verified receipt/latest response.
+    }
+  }
+  if (!results.has("latest")) throw new RpcError("rpc_missing_response:latest");
+  return results;
+}
+
+function canonicalHeads(results: Map<string, unknown>): ChainHeads {
+  const latest = parseBlock(results.get("latest"), "latest");
+  const optional = (id: string): bigint | null => {
+    try {
+      const head = parseOptionalBlock(results.get(id), id);
+      return head && head.number <= latest.number ? head.number : null;
+    } catch (error) {
+      if (!(error instanceof RpcVerificationError)) throw error;
+      return null;
+    }
+  };
+  const finalizedBlock = optional("finalized");
+  let safeBlock = optional("safe");
+  // A stale safe response must not invalidate independently useful finalized evidence.
+  if (safeBlock !== null && finalizedBlock !== null && safeBlock < finalizedBlock) safeBlock = null;
+  return { latestBlock: latest.number, safeBlock, finalizedBlock };
 }
 
 export class RpcError extends Error {
@@ -506,4 +567,38 @@ function topicAddress(topic: string, code: string): string {
 
 function toQuantity(value: bigint): string {
   return `0x${value.toString(16)}`;
+}
+
+async function boundedRpcJson(response: Response, maximum: number): Promise<unknown> {
+  if (!Number.isSafeInteger(maximum) || maximum <= 0) throw new RpcError("rpc_invalid_byte_limit");
+  const declared = response.headers.get("content-length");
+  if (declared && /^\d+$/.test(declared) && Number(declared) > maximum) {
+    await response.body?.cancel();
+    throw new RpcError("rpc_response_too_large");
+  }
+  if (!response.body) throw new RpcError("rpc_invalid_json");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > maximum) {
+        await reader.cancel();
+        throw new RpcError("rpc_response_too_large");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(bytes));
 }

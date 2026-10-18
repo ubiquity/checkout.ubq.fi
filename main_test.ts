@@ -1,4 +1,5 @@
 import { test } from "bun:test";
+import { RuntimeRpc } from "./src/account_runtime_test_fixture.ts";
 import { SqliteKv } from "./src/sqlite_kv.ts";
 import { fetchPublicAsset } from "./src/bun_runtime.ts";
 import {
@@ -10,6 +11,15 @@ import {
 } from "./main.ts";
 import { LOCAL_PEER_HEADER } from "./src/admin_auth.ts";
 import type { JsonRpcBatchItem, JsonRpcCall, RpcClient } from "./src/rpc.ts";
+import type { Kv } from "./src/kv.ts";
+import {
+  chainEventReceiptKey,
+  pendingChainTransfersKey,
+  processChainEventDelivery,
+  type ChainEventReceipt,
+} from "./src/chain_ingress.ts";
+import type { VerifiedChainEventDelivery } from "./src/chain_events.ts";
+import { WorkerRequestBudget } from "./src/worker_budget.ts";
 
 const TREASURY = "0x1111111111111111111111111111111111111111";
 
@@ -164,6 +174,261 @@ test("reading an invoice never performs expiration writes", async () => {
   assertEquals(expirations, 0);
 });
 
+test("claims accept an empty discovery object or exactly four coordinates after authorization", async () => {
+  await withApp(async ({ request, handler }) => {
+    await request("/api/v1/admin/chains/8453", {
+      method: "PUT",
+      adminMutation: true,
+      body: { enabled: true, treasuryAddress: TREASURY },
+    });
+    await request("/api/v1/catalog/versions/claim-prices", {
+      method: "PUT",
+      body: {
+        currency: "USD",
+        products: [
+          { productId: "pack", label: "Pack", kind: "credit_pack", priceCents: 500, enabled: true },
+        ],
+      },
+    });
+    const created = await request("/api/v1/invoices", {
+      method: "POST",
+      headers: { "idempotency-key": "discovery" },
+      body: {
+        customerReference: "claim-customer",
+        pricingVersionId: "claim-prices",
+        productId: "pack",
+        chainId: 8453,
+      },
+    });
+    assertEquals(created.status, 201);
+    const invoice = await created.json();
+    const path = `/api/v1/invoices/${invoice.id}/claims`;
+    const found = await request(path, { method: "POST", body: {} });
+    assertEquals(found.status, 200);
+    assertEquals((await found.json()).discovery, { found: false, searchedToBlock: "100" });
+    const coordinates = {
+      transactionHash: "invalid",
+      logIndex: "0",
+      observedBlockNumber: "100",
+      observedBlockHash: `0x${"ab".repeat(32)}`,
+    };
+    for (const body of [
+      { transactionHash: "invalid" },
+      { ...coordinates, extra: true },
+      { unrelated: true },
+    ]) {
+      const rejected = await request(path, { method: "POST", body });
+      assertEquals(rejected.status, 400);
+      assertEquals(await rejected.json(), { error: "invalid_claim_input" });
+    }
+    const coordinateClaim = await request(path, { method: "POST", body: coordinates });
+    assertEquals(coordinateClaim.status, 400);
+    assertEquals(await coordinateClaim.json(), { error: "invalid_transaction_hash" });
+    const unauthorized = await handler(
+      new Request(`https://checkout.ubq.fi${path}`, { method: "POST", body: '{"extra":true}' }),
+    );
+    assertEquals(unauthorized.status, 401);
+  });
+});
+
+test("unsigned chain ingress fails before any storage or payment callback", async () => {
+  const kv = new SqliteKv();
+  try {
+    let reads = 0,
+      mutations = 0;
+    const get = kv.get.bind(kv);
+    kv.get = (key) => {
+      reads++;
+      return get(key);
+    };
+    const services = createCheckoutServices(kv, {
+      chainWebhookKeys: JSON.stringify({
+        hook: { network: "BASE_MAINNET", signingKey: "offline" },
+      }),
+    });
+    services.payment.processChainTransfer = async () => {
+      mutations++;
+      return { terminal: true, disposition: "ignored" };
+    };
+    const response = await createHandler(services)(
+      new Request("https://checkout.ubq.fi/api/v1/chain-events/alchemy", {
+        method: "POST",
+        body: JSON.stringify({ webhookId: "hook" }),
+      }),
+    );
+    assertEquals(response.status, 401);
+    assertEquals(reads, 0);
+    assertEquals(mutations, 0);
+  } finally {
+    kv.close();
+  }
+});
+
+for (const alreadyClaimed of [true, false])
+  test(`authenticated related GET handles pending chain receipt within24 calls (claimed=${alreadyClaimed})`, async () => {
+    const store = new SqliteKv();
+    try {
+      const seed = createCheckoutServices(store, {
+        rpc: new StaticRpc(),
+        resolveDns: async () => ["93.184.216.34"],
+      });
+      await seed.merchantAuth.upsertMerchant({
+        id: "related",
+        name: "Related",
+        settlementWebhookUrl: "https://merchant.example/events",
+      });
+      const { token } = await seed.merchantAuth.createKey({
+        merchantId: "related",
+        label: "Related",
+      });
+      await seed.payment.configureChain(8453, { enabled: true, treasuryAddress: TREASURY });
+      await seed.payment.publishCatalogVersion({ merchantId: "related" }, "related-prices", {
+        currency: "USD",
+        products: [
+          { productId: "pack", label: "Pack", kind: "credit_pack", priceCents: 500, enabled: true },
+        ],
+      });
+      const created = await seed.payment.createInvoice(
+        { merchantId: "related", idempotencyKey: "related" },
+        {
+          customerReference: "customer",
+          pricingVersionId: "related-prices",
+          productId: "pack",
+          chainId: 8453,
+        },
+      );
+      const invoice = await seed.payment.getInvoiceRecord(created.id);
+      const prefix = ["uos_checkout", "v1", "payments"];
+      const transfer = {
+        chainId: 8453 as const,
+        transactionHash: `0x${"11".repeat(32)}`,
+        logIndex: 7,
+        blockNumber: invoice.minimumBlock,
+        blockHash: `0x${"ab".repeat(32)}`,
+        tokenAddress: invoice.tokenAddress,
+        payerAddress: `0x${"33".repeat(20)}`,
+        recipientAddress: invoice.treasuryAddress,
+        amountUnits: invoice.paidAmountUnits,
+        removed: false,
+      };
+      const instant = new Date().toISOString();
+      if (alreadyClaimed)
+        await store
+          .atomic()
+          .set([...prefix, "invoices", invoice.id], {
+            ...invoice,
+            status: "confirming",
+            paymentId: "related-payment",
+          })
+          .set([...prefix, "payment_locators", 8453, transfer.transactionHash, transfer.logIndex], {
+            invoiceId: invoice.id,
+            paymentId: "related-payment",
+            duplicate: false,
+          })
+          .set([...prefix, "payment_records", "related-payment"], {
+            schemaVersion: 1,
+            id: "related-payment",
+            invoiceId: invoice.id,
+            chainId: 8453,
+            transactionHash: transfer.transactionHash,
+            logIndex: 7,
+            payer: transfer.payerAddress,
+            tokenAddress: transfer.tokenAddress,
+            treasuryAddress: transfer.recipientAddress,
+            amountUnits: transfer.amountUnits,
+            blockNumber: transfer.blockNumber,
+            blockHash: transfer.blockHash,
+            blockTimestamp: instant,
+            phase: "confirming",
+            firstObservedAt: instant,
+            updatedAt: instant,
+          })
+          .commit();
+      const delivery: VerifiedChainEventDelivery = {
+        provider: "alchemy",
+        subscriptionId: "hook",
+        eventId: "related-event",
+        deliveryId: "related-delivery",
+        createdAt: instant,
+        bodySha256: "a".repeat(64),
+        transfers: [transfer],
+      };
+      await processChainEventDelivery(delivery, {
+        kv: store,
+        minimumTransferCalls: 0,
+        processTransfer: async () => ({ terminal: false }),
+      });
+      assertEquals(
+        (await store.get<ChainEventReceipt>(chainEventReceiptKey(delivery))).value?.state,
+        "pending",
+      );
+      const budget = new WorkerRequestBudget(24);
+      budget.reserve(); // The completed migration object's one HTTP binding call.
+      const kv: Kv = {
+        get: (key) => {
+          budget.reserve();
+          return store.get(key);
+        },
+        getMany: (keys) => {
+          budget.reserve();
+          return store.getMany(keys);
+        },
+        set: (key, value, options) => {
+          budget.reserve();
+          return store.set(key, value, options);
+        },
+        delete: (key) => {
+          budget.reserve();
+          return store.delete(key);
+        },
+        list: () => {
+          throw new Error("related recovery must not list");
+        },
+        listPage: () => {
+          throw new Error("related recovery must not page");
+        },
+        atomic: () => {
+          const atomic = store.atomic();
+          const commit = atomic.commit.bind(atomic);
+          atomic.commit = () => {
+            budget.reserve();
+            return commit();
+          };
+          return atomic;
+        },
+        close: () => {},
+      };
+      let rpcCalls = 0;
+      const services = createCheckoutServices(kv, {
+        budget,
+        chainWebhookKeys: "{}",
+        rpc: {
+          batch: async () => {
+            rpcCalls++;
+            throw new Error("already-claimed cleanup must not query RPC");
+          },
+        },
+      });
+      const response = await createHandler(services)(
+        new Request(`https://checkout.ubq.fi/api/v1/invoices/${invoice.id}`, {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      );
+      assertEquals(response.status, 200);
+      console.log(`related authenticated GET calls=${24 - budget.remaining}/24,rpc=${rpcCalls}`);
+      assertEquals(
+        (await store.get<ChainEventReceipt>(chainEventReceiptKey(delivery))).value?.state,
+        "pending",
+      );
+      const pendingReferences = (await store.get(pendingChainTransfersKey(transfer))).value;
+      assert(Array.isArray(pendingReferences) && pendingReferences.length === 1);
+      assertEquals(rpcCalls, 0);
+      assert(budget.remaining >= 0);
+    } finally {
+      store.close();
+    }
+  });
+
 test("public origins cannot forge loopback trust", async () => {
   await withApp(async ({ handler }) => {
     const forged = await handler(
@@ -255,19 +520,21 @@ async function withApp(
   run: (value: {
     request: RequestFn;
     handler: (request: Request) => Promise<Response>;
+    services: ReturnType<typeof createCheckoutServices>;
   }) => Promise<void>,
+  rpc: RpcClient = new StaticRpc(),
 ): Promise<void> {
   const kv = new SqliteKv(":memory:");
-  const handler = createHandler(
-    createCheckoutServices(kv, {
-      rpc: new StaticRpc(),
-      assetFetcher: fetchPublicAsset,
-      resolveDns: () => Promise.resolve(["93.184.216.34"]),
-    }),
-  );
+  const services = createCheckoutServices(kv, {
+    rpc,
+    assetFetcher: fetchPublicAsset,
+    resolveDns: () => Promise.resolve(["93.184.216.34"]),
+  });
+  const handler = createHandler(services);
   try {
     await run({
       handler,
+      services,
       request: async (pathname, init = {}) => {
         const headers = new Headers(init.headers);
         if (init.body !== undefined) headers.set("content-type", "application/json");
@@ -330,4 +597,64 @@ test("HTTP JSON rejects oversized streamed bodies before payment work", async ()
     assertEquals(response.status, 413);
     assertEquals((await response.json()).error, "request_body_too_large");
   });
+});
+
+test("authenticated account check spans attempts, credits canonical matches and returns the requested anchor", async () => {
+  const rpc = new RuntimeRpc();
+  await withApp(async ({ request, services }) => {
+    await request("/api/v1/admin/chains/8453", {
+      method: "PUT",
+      adminMutation: true,
+      body: { enabled: true, treasuryAddress: TREASURY },
+    });
+    await request("/api/v1/catalog/versions/account-price", {
+      method: "PUT",
+      body: {
+        currency: "USD",
+        products: [
+          { productId: "pack", label: "Pack", kind: "credit_pack", priceCents: 100, enabled: true },
+        ],
+      },
+    });
+    const create = async (id: string) =>
+      await (
+        await request("/api/v1/invoices", {
+          method: "POST",
+          headers: { "idempotency-key": id },
+          body: {
+            customerReference: "account",
+            pricingVersionId: "account-price",
+            productId: "pack",
+            chainId: 8453,
+          },
+        })
+      ).json();
+    const old = await create("old");
+    const latest = await create("latest");
+    assert(old.id !== latest.id);
+    rpc.add(await services.payment.getInvoiceRecord(latest.id), 200n);
+    rpc.latest = 300n;
+    rpc.safe = 250n;
+    const response = await request(`/api/v1/invoices/${old.id}/claims`, {
+      method: "POST",
+      body: {},
+    });
+    assertEquals(response.status, 200);
+    const result = await response.json();
+    assertEquals(result.invoice.id, old.id);
+    assertEquals(result.discovery.found, false);
+    assertEquals(result.discovery.searchedToBlock, "300");
+    assertEquals(result.accountHunt.reachedHead, true);
+    assertEquals(
+      result.accountHunt.attempts.find((value: { invoiceId: string }) => value.invoiceId === old.id)
+        .outcome,
+      "invalidated",
+    );
+    assertEquals(
+      result.accountHunt.attempts.find(
+        (value: { invoiceId: string }) => value.invoiceId === latest.id,
+      ).outcome,
+      "credited",
+    );
+  }, rpc);
 });

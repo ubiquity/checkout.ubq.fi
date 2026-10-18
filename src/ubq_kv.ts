@@ -10,10 +10,13 @@ import {
   type KvKey,
   type KvListOptions,
   type KvListSelector,
+  type KvPage,
+  type KvPageOptions,
   listPrefix,
   selectEntries,
   validateKey,
 } from "./kv.ts";
+import { pageAfter, pageCursor, validatePage } from "./kv_paging.ts";
 
 type WireEntry = { key: KvKey; value: unknown; versionstamp: string };
 type Fetcher = (input: string, init: RequestInit) => Promise<Response>;
@@ -112,6 +115,40 @@ export class UbqKv implements Kv {
     // The service orders encoded keys lexically and supports prefix/cursor only.
     // Fetch the derived prefix completely before applying tuple ranges and limit.
     yield* selectEntries(entries, selector, options);
+  }
+
+  async listPage<T>(logicalPrefix: KvKey, options: KvPageOptions): Promise<KvPage<T>> {
+    validatePage(logicalPrefix, options);
+    if (logicalPrefix[0] !== "uos_checkout" || logicalPrefix[1] !== "v1") {
+      throw new TypeError("uos_kv_page_namespace_required");
+    }
+    const prefix = serverListPrefix(logicalPrefix);
+    const after = pageAfter(options.cursor, "service", logicalPrefix, prefix);
+    const page = await this.request<{ entries: WireEntry[]; cursor: string | null }>("/kv/list", {
+      prefix,
+      limit: options.limit,
+      cursor: after,
+    });
+    if (
+      !Array.isArray(page.entries) ||
+      page.entries.length > options.limit ||
+      (page.cursor !== null &&
+        (typeof page.cursor !== "string" || !page.cursor || page.cursor === after))
+    ) {
+      throw new Error("uos_kv_invalid_page");
+    }
+    return {
+      entries: page.entries
+        .filter(
+          (entry) =>
+            entry.key.length > logicalPrefix.length &&
+            logicalPrefix.every((part, index) => part === entry.key[index]),
+        )
+        .map(fromWire<T>),
+      // The cursor belongs to the raw page even when every row was filtered out.
+      cursor:
+        page.cursor === null ? null : pageCursor("service", logicalPrefix, prefix, page.cursor),
+    };
   }
 
   atomic(): KvAtomic {

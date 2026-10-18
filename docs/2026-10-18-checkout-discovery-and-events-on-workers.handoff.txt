@@ -1,0 +1,163 @@
+# Handoff: claim a crypto invoice by id alone on the Workers checkout, and replace the 1-minute cron with per-invoice events
+
+> **Owner rule (2026-10-18), overriding anything below: no cron, ever.** Everything is purely event-based. No `Deno.cron`, no Worker cron trigger, no `setInterval` sweep, no "low-frequency backstop" and no daily retention pass. Each piece of work is scheduled by the event that creates it, for exactly when it is due: a KV delayed enqueue or a Durable Object alarm. Where one delay cannot reach that far (90 days, 13 months), chain the delays. A lost or failed enqueue is recovered only by events, never by a timer. Those events are process startup, the next related write or request, or an alarm set when the work was created. Every existing cron goes. If something truly cannot be made event-driven, stop and explain it in the report; do not add a cron.
+
+**For:** Codex on the VPS (`codex@arch`). **Repo:** `ubiquity/checkout.ubq.fi`, branch `development`. **Date:** 2026-10-18. **Owner decision:** "Discovery + events".
+
+## Why this exists
+
+Checkout moved from the Deno VPS service to **Bun and Cloudflare Workers Free**: PR #3, `codex/bun-workers-migration`, merged at 03:52 UTC. Production `checkout.ubq.fi` is now the Worker `checkout-ubq-fi`.
+
+The earlier crypto-claim work in **PR #2** (`codex/2026-10-17-crypto-claim-discovery-g141810ab38`) was written for the old Deno service and no longer fits:
+- it conflicts with `development`;
+- it uses a different storage envelope on the same D1;
+- its work queue runs on in-process timers, which a Worker cannot keep.
+
+That PR is superseded by this task. Its logic and lessons still apply, and its tests are the best specification there is.
+
+Two outcomes are wanted on the Workers codebase:
+
+1. **Part A: discovery claim.** `POST /api/v1/invoices/{id}/claims` with an empty body `{}` finds the payment for that one invoice on chain and claims it. No person in a chat knows the four on-chain coordinates.
+2. **Part B: events instead of cron.** The owner asked for everything to be event-based instead of cron (*"cron wastes so much resources"*). `wrangler.jsonc` currently plans a `* * * * *` cron (`triggers.crons`), which a separate rollout lane meant to activate when PR #3 merged; that deploy failed on a Cloudflare permission, so production runs **no** scheduler right now. Replace the cron with per-invoice scheduled wake-ups. **Durable Object alarms** are the expected tool: SQLite-backed Durable Objects are on the Workers Free plan. Check the current Free-plan limits yourself and cite them.
+
+## The contract Prospector already ships
+
+`ubiquity/prospector` PR #162 is merged and live, at a77c767d or later. Its client (`src/crypto_checkout.ts`: `discoverPayment`, and the parser around lines 660-690) calls checkout with `{}` and accepts:
+- `{ invoice, eventJws?, discovery?: { found: boolean, searchedToBlock?: "<decimal string>" } }`;
+- found: the same response as a coordinate claim, `invoice` and `eventJws`;
+- not found: HTTP 200 with the invoice as it stands and `discovery: { found: false, searchedToBlock }`. Not paid yet is a normal answer;
+- already paid: the invoice's current state, idempotently.
+
+Keep exactly this shape. If the Worker has to answer "still searching" (see the limits below), express it inside this shape. For example, `found: false` with the block reached so far tells a caller "not seen yet". Do not invent a field that Prospector rejects. Read Prospector's parser before deciding.
+
+## Part A: what to carry over and what must change
+
+**Carry over from PR #2 and its fixes** (read its diff, its tests, and issues checkout.ubq.fi #4 and #5):
+- **One match predicate, shared with reconciliation.** Match on: no payment, or a reverted one; `minimumBlock <= block`; same token; same treasury; exact `paidAmountUnits`. Open invoices reserve distinct amounts, which is why an exact-amount match is safe.
+- **Search range:** from `invoice.minimumBlock` to the same safe, then finalized, then latest head that reconciliation uses.
+- **Never** read or advance a reconciliation cursor from a discovery claim.
+- **Report the result from the returned state, never the path taken** (issue #4). `found` is true only if the invoice that comes back carries a current payment. A reorg can clear it.
+- **Idempotency:** a second claim after success returns the paid state. A duplicate wake-up neither double-claims nor double-delivers.
+- **Reject anything that is neither `{}` nor the four coordinates.** Use the existing invalid-input error style. The four-field claim keeps working exactly as today; the browser wallet watcher uses it.
+
+**What changes on a Worker:**
+- **Subrequest and CPU limits.** One request has a capped number of subrequests (fetch and KV/D1 calls), and a Free Worker has a small CPU budget. `src/worker_budget.ts` and `src/reconciliation_batch.ts` already encode this codebase's answer; use them.
+- **Durable search progress.** A long range (an invoice open for hours on Base spans thousands of blocks) must be searched in chunks, with progress saved per invoice, so repeated calls or wake-ups make progress instead of starting over. A request that runs out of budget saves its progress and answers `found: false` with the block it reached.
+- **The storage envelope** is the one on `development` (`src/kv_codec.ts`). Production is already writing it.
+
+## Part B: events instead of the cron
+
+1. **Inventory first.** List everything the Worker's `scheduled()` handler and `reconciliation_batch.ts` do: reconciliation per chain, expiry, refresh, outbox and webhook delivery and retries, retention, anything else. Put the list in the report. Each item needs an event-driven home before the cron goes.
+2. **Per-invoice wake-ups.**
+   - When an invoice is created, schedule its first discovery a short time later.
+   - If nothing is found and the invoice is still open, back off: 1, 2, 5, 10 and 20 minutes, then every 30, never past expiry.
+   - Stop when the invoice is paid, expired or cancelled.
+   - A `{}` claim is the immediate event when a person says they paid.
+3. **Expiry** fires at the invoice's own expiry time.
+4. **Webhook and outbox delivery** is scheduled when the event is written, and retried with backoff on failure.
+5. **Remove the cron trigger.** Every item from step 1 gets an event-driven home, and tests prove it.
+   - Remove the `triggers.crons` entry and the `scheduled()` handler. A reverted payment after a reorg is re-checked by an alarm set when the payment was accepted, not by a sweep.
+   - With no open invoices and no pending deliveries, the system does no periodic work.
+6. **Migration of existing state.** Invoices that are open at cutover, and deliveries already pending, must get their wake-ups. Do this with a one-time, idempotent pass triggered by an event (the first request after the deploy, or an explicit admin call), never by a schedule. Say exactly how it runs.
+7. **Lifecycle discipline** (issue #5): every asynchronous continuation checks it is still current before it schedules or runs anything.
+
+## Rules for this run
+
+- **Work in a new git worktree** on a new branch from the latest `origin/development`:
+  - `git -C ~/repos/ubiquity/checkout.ubq.fi fetch origin development`, then `git -C ~/repos/ubiquity/checkout.ubq.fi worktree add ~/handoffs/worktrees/checkout-discovery-events -b codex/checkout-discovery-events origin/development`.
+  - `~/repos/ubiquity/checkout.ubq.fi` is the persistent root of another lane's Bun releases (`.deploy-root/`). Do not change its branch, index, files or `.deploy-root`.
+  - Do not touch `/tmp/checkout-free-worker-probe` or the PR #2 worktree.
+- **No production effects.** That means:
+  - no `wrangler deploy`, no Cloudflare API calls, no D1 or KV writes outside local fakes;
+  - no service restarts, no on-chain transactions, no public RPC;
+  - local Miniflare or `wrangler dev --local` and the repo's own fakes are fine.
+- **Merging to `development` deploys production** (`.github/workflows/workers-deploy.yml`). So open a **draft** PR and never merge. Do not use `[skip ci]`: CI is wanted on this PR.
+- Follow the repo's `AGENTS.md` and `DECISIONS.md`. Record the durable decisions (events instead of cron, and the discovery contract) in `DECISIONS.md`. File a copy of this handoff on your branch under the repo's docs convention.
+- Run the repo's full offline gate. Commit in small steps and push.
+- Finish with a report covering:
+  - what changed, with commits;
+  - the scheduled-work inventory and where each item now lives;
+  - the Free-plan limits you designed against, with sources;
+  - how existing open invoices and pending deliveries are migrated;
+  - the test commands and results;
+  - anything not done, and why.
+
+## Owner decision (2026-10-18): payments are detected by a chain webhook
+
+
+Design it this way:
+1. Inbound endpoint. Checkout receives push events from a chain indexer when a treasury address receives a token transfer. Build a provider-neutral, signed chain-event endpoint with an adapter for Alchemy Address Activity webhooks, the recommended free-tier provider. Read Alchemy's current docs for the payload, signature header and HMAC scheme, and cite them.
+   - Verify the signature with a Worker secret. Reject unsigned, stale or replayed deliveries.
+   - Parse transfers to the configured treasury addresses for the supported tokens and chains.
+   - Match each transfer to an open invoice with the same shared match predicate as discovery.
+   - Claim it with the transfer's own coordinates: tx hash, log index, block number and block hash.
+   - Duplicate deliveries and out-of-order deliveries must be idempotent.
+   - If the provider marks a log as removed (a reorg), handle it through the existing reverted-payment path.
+2. Check every chain checkout supports against the provider's supported networks. Report any chain it cannot cover. Do not fall back to polling for it.
+3. Alarms remain only for events whose time is known when the work is created. Each alarm is scheduled by the event that created it:
+   - invoice expiry at expiresAt;
+   - confirmation progression (the safe or finalized re-check at the time that depth is expected);
+   - webhook-delivery retries to merchants.
+   No alarm exists to look for new payments.
+4. Backups that are themselves events stay as they are:
+   - the payer's wallet report (the four-field claim);
+   - the claim by invoice id (`{}` discovery);
+   - one discovery pass over the invoice's range when its expiry alarm fires, before it expires, which catches a missed webhook.
+5. Setup is the owner's job, so do none of it.
+   - Do not create webhooks.
+   - Do not call the indexer's or Cloudflare's APIs.
+   - Do not add secrets anywhere real.
+   - Document exactly what the owner must do: which addresses and networks to register, which events to subscribe to, the endpoint URL, and the `wrangler secret put` names.
+   - Tests use signed fake deliveries.
+Everything else, including the no-cron rule and the draft-PR deliverable, is unchanged. Re-read the handoff's Owner rule if you need to. Continue from where you are.
+
+## Owner redesign (2026-10-18): attempts and one hunt per account
+
+The owner has redesigned how a payment is found. Apply it on top of what you have built. The no-cron rule and the chain webhook stay.
+
+Measurements (2026-10-18, read-only, files under ~/handoffs/tmp-archive-20261018/payment-check-timing/):
+- One check, on the a545089 design: 2 RPC requests (heads about 180 ms median, one getLogs of at most 1,000 blocks about 175 ms median) plus about 13 KV calls.
+- One press covers only 1,000 blocks, about 33 minutes on Base, so a late payment needed a second press. The owner called that design wrong.
+- The search stops at the safe head, which trails latest by about 1-4 min on Base, 30-60 s on Optimism and about 7 min on Ethereum. So a press right after paying says "nothing".
+- rpc.ubq.fi is a VPS proxy over free public RPCs. About 1 in 3 Base checks in the sample would have failed: a stale "safe" head 13-17 days old, a "free plan" range refusal on a 1,000-block range, and errors passed through without retrying another upstream.
+- The response could not say how far the search had reached.
+- The found path uses all 24 calls of the budget, and the 21st is refused and swallowed.
+- DECISIONS.md and the blueprint still say the HTTP budget is 40.
+
+THE DESIGN (owner's):
+1. Attempts. Every invoice the payment dialog creates is an attempt with its own reserved amount. An attempt stays a payment candidate until it is resolved, either paid or invalidated. The 1-hour expiry no longer ends its candidacy. Keep each amount reserved until its attempt is resolved, so a late payment can never match another account's invoice that reused the amount.
+2. One hunt per account, not one per invoice. The hunt looks at every transfer to the treasury for the supported tokens, from the account's earliest unresolved attempt up to now, and matches each one against all of that account's unresolved attempts at once, by the shared predicate and the distinct amount.
+   - Triggers are events only: the "check again" button (the `{}` claim, or an account-level equivalent), a chain-webhook delivery, the payer's wallet report, and creation of a new attempt.
+3. Resolution. When a transfer pays an attempt (normally the latest), credit it. Then check whether any earlier unresolved attempt was also paid. Any earlier attempt with no matching transfer is invalidated, and its reservation is released.
+   - A transfer that matches no live attempt is recorded for review. It is never dropped.
+4. One request covers the whole span, using standards-compliant JSON-RPC 2.0 batches and nothing provider-specific. The owner rejected provider-specific APIs, so do NOT use alchemy_getAssetTransfers or any other non-standard method. The hunt sends ONE HTTP POST whose body is a JSON array of standard `eth_getLogs` requests: one per 1,000-block chunk (the per-call range every upstream accepts), from the earliest unresolved attempt's block to the head. One subrequest then covers any span. Merge the head lookup into a batch where you can.
+   Follow JSON-RPC 2.0 section 6 exactly:
+   - every request has a unique id;
+   - match responses by id, never by position, because the order is not guaranteed;
+   - handle each entry's `error` on its own;
+   - treat an entry with no response as failed;
+   - treat a non-array reply, or an HTTP error, as the whole batch failing;
+   - never send an empty batch.
+   Resend only the failed entries, in one more batch, within the subrequest budget, and say what the response reports if entries still fail. If a provider rejects the batch size, split it into the fewest batches it accepts.
+   Measured against rpc.ubq.fi on Base, 2026-10-18:
+   | Batch | Time | Failed entries |
+   |---|---|---|
+   | 2 chunks (2,000 blocks, about 1 hour) | 166 ms | 0 |
+   | 9 chunks | 185 ms | 1 |
+   | 44 chunks (44,000 blocks, about 1 day) | 0.3-1.5 s | 8-12 |
+   All ids were answered, in order, with HTTP 200. The failures are periodic (every 8-9 entries, including the newest ranges), not tied to block age. That fits the proxy spreading entries across upstreams with one bad upstream, which answers "ranges over 10000 blocks are not supported on free plan" for a 1,000-block range, or "Archive requests require a personal token". Resending the failed ids should reach healthy upstreams; test that with a fake that fails a fixed subset.
+   The script is batch_logs.py, with its output, under ~/handoffs/tmp-archive-20261018/payment-check-timing/. No real RPC calls in tests.
+5. Confirming state. Record a payment as soon as it is seen at latest, in the existing confirming state, so the button can answer "payment seen, confirming". Credit it at safe or finalized through the alarm scheduled when the payment was seen. A reorg goes through the existing reverted path.
+6. Response. The hunt's response says how far it searched and whether that reached the head. The contract Prospector already ships (`discovery: { found, searchedToBlock }`) must keep parsing. Add new information only in fields Prospector's parser tolerates; read it first. Also return per-attempt outcomes: credited, confirming, nothing yet, or invalidated.
+7. Budget. The found path must not run at zero headroom. Fix the budget accounting, and make DECISIONS.md and the blueprint match the code.
+
+Update DECISIONS.md with the attempts and hunt model and the reservation lifetime. Write tests for:
+- a late payment on an expired attempt;
+- several attempts with the latest paid;
+- an earlier attempt paid after a later one;
+- an unmatched transfer;
+- a reorg while confirming;
+- a duplicate webhook versus a hunt;
+- pagination across pages;
+- a chain without the indexed query.
+Then run the full gate. Everything else is unchanged: draft PR, never merged, no production effects, no real API calls. Continue from where you are.

@@ -11,9 +11,12 @@ import {
   type KvKey,
   type KvListOptions,
   type KvListSelector,
+  type KvPage,
+  type KvPageOptions,
   selectEntries,
   validateKey,
 } from "./kv.ts";
+import { pageAfter, pageCursor, validatePage } from "./kv_paging.ts";
 
 type Row = { k: string; v: string; version: string; expires: number | null };
 type Mutation =
@@ -76,6 +79,27 @@ export class SqliteKv implements Kv {
       versionstamp: row.version,
     }));
     yield* selectEntries(entries, selector, options);
+  }
+
+  async listPage<T>(prefix: KvKey, options: KvPageOptions): Promise<KvPage<T>> {
+    validatePage(prefix, options);
+    const after = pageAfter(options.cursor, "sqlite", prefix, prefix) ?? "";
+    const rawPrefix = prefix.length ? JSON.stringify(prefix).slice(0, -1) + "," : "[";
+    const rows = this.db
+      .query<Row, [number, number, string, string, number]>(
+        "SELECT k,v,version,expires FROM uos_kv WHERE (expires IS NULL OR expires > ?) AND substr(k,1,?)=? AND k>? ORDER BY k LIMIT ?",
+      )
+      .all(this.now(), rawPrefix.length, rawPrefix, after, options.limit + 1);
+    const page = rows.slice(0, options.limit);
+    return {
+      entries: page.map((row) => ({
+        key: JSON.parse(row.k) as KvKey,
+        value: decodeKvValue(JSON.parse(row.v)) as T,
+        versionstamp: row.version,
+      })),
+      cursor:
+        rows.length > options.limit ? pageCursor("sqlite", prefix, prefix, page.at(-1)!.k) : null,
+    };
   }
 
   atomic(): KvAtomic {

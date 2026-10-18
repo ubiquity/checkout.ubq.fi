@@ -1,4 +1,7 @@
-import { WorkerBudgetError } from "./src/worker_budget.ts";
+import { WorkerBudgetError, type WorkerRequestBudget } from "./src/worker_budget.ts";
+import { handleAlchemyChainWebhook, recoverPendingChainTransfers } from "./src/chain_ingress.ts";
+import type { DiscoveryOptions } from "./src/payment_discovery.ts";
+import type { WakeupPort } from "./src/wakeup.ts";
 import type { FetchLike } from "./src/rpc.ts";
 import type { Kv } from "./src/kv.ts";
 import {
@@ -13,7 +16,11 @@ import {
   type MerchantScope,
 } from "./src/merchant_auth.ts";
 import { type CompactJwsSigner, createPersistentJwsSigner, JwsError } from "./src/jws.ts";
-import { createPaymentService, type PaymentService } from "./src/payment_service.ts";
+import {
+  createPaymentService,
+  type PaymentService,
+  type SignedOutboxEvent,
+} from "./src/payment_service.ts";
 import { type InvoiceJson, PaymentDomainError } from "./src/payment_types.ts";
 import { HttpRpcClient, type RpcClient, RpcError, RpcVerificationError } from "./src/rpc.ts";
 import { type ResolvedWebhookTarget, type WebhookDeliveryResponse } from "./src/webhook.ts";
@@ -29,6 +36,9 @@ const OUTBOX_MAX_EVENTS_PER_RUN = 1_000;
 type MerchantAuthService = ReturnType<typeof createMerchantAuthService>;
 
 export type CheckoutServices = {
+  chainWebhookKeys?: string;
+  budget?: WorkerRequestBudget;
+  wakeups?: WakeupPort;
   kv: Kv;
   rpc: RpcClient;
   adminAuth: AdminAuthService;
@@ -44,12 +54,16 @@ export type CheckoutServices = {
 };
 
 type CheckoutServiceOptions = {
+  chainWebhookKeys?: string;
+  budget?: WorkerRequestBudget;
   fetch?: FetchLike;
   assetFetcher?: CheckoutServices["assetFetcher"];
   rpc?: RpcClient;
   signer?: CompactJwsSigner;
   resolveDns?: (hostname: string, recordType: "A" | "AAAA") => Promise<string[]>;
   webhookSender?: CheckoutServices["webhookSender"];
+  discovery?: DiscoveryOptions;
+  wakeups?: WakeupPort;
 };
 
 export function createCheckoutServices(
@@ -60,6 +74,9 @@ export function createCheckoutServices(
   const signer = options.signer ?? createPersistentJwsSigner(kv);
   const rpc = options.rpc ?? new HttpRpcClient(fetcher);
   return {
+    chainWebhookKeys: options.chainWebhookKeys,
+    budget: options.budget,
+    wakeups: options.wakeups,
     kv,
     rpc,
     adminAuth: createAdminAuthService(kv, { fetch: fetcher }),
@@ -68,6 +85,8 @@ export function createCheckoutServices(
       kv,
       rpc,
       signer,
+      discovery: options.discovery,
+      wakeups: options.wakeups,
     }),
     fetcher,
     assetFetcher: options.assetFetcher ?? (async () => new Response(null, { status: 404 })),
@@ -93,6 +112,16 @@ export function createHandler(services: CheckoutServices): (request: Request) =>
 
 async function route(request: Request, services: CheckoutServices): Promise<Response> {
   const url = new URL(request.url);
+  if (url.pathname === "/api/v1/chain-events/alchemy" && request.method === "POST") {
+    return handleAlchemyChainWebhook(request, {
+      webhookKeys: services.chainWebhookKeys,
+      kv: services.kv,
+      budget: services.budget,
+      minimumTransferCalls: 12,
+      prepareTransfer: services.payment.prepareChainTransfer,
+      processTransfer: services.payment.processChainTransfer,
+    });
+  }
 
   if (url.pathname === "/api/health" && request.method === "GET") {
     return json({ status: "ready" });
@@ -231,6 +260,7 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
         chainId: body.chainId,
       },
     );
+    await relatedInvoiceEvent(services, invoice);
     return json(invoice, { status: 201 });
   }
 
@@ -239,7 +269,9 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
     const principal = await services.merchantAuth.authenticate(request, ["invoice:read"]);
     const invoiceId = decodeURIComponent(invoiceMatch[1]);
     await requireMerchantInvoice(services, principal.merchant.id, invoiceId);
-    return json(await services.payment.getInvoice(invoiceId));
+    const invoice = await services.payment.getInvoice(invoiceId);
+    await relatedInvoiceEvent(services, invoice);
+    return json(invoice);
   }
 
   const claimMatch = url.pathname.match(/^\/api\/v1\/invoices\/([^/]+)\/claims$/);
@@ -248,14 +280,30 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
     const invoiceId = decodeURIComponent(claimMatch[1]);
     await requireMerchantInvoice(services, principal.merchant.id, invoiceId);
     const body = await requestJson(request);
-    return json(
-      await services.payment.claimPayment(invoiceId, {
-        transactionHash: body.transactionHash,
-        logIndex: body.logIndex,
-        observedBlockNumber: body.observedBlockNumber,
-        observedBlockHash: body.observedBlockHash,
-      }),
-    );
+    const keys = Object.keys(body);
+    if (keys.length === 0) {
+      const result = await services.payment.discoverPayment(invoiceId);
+      await relatedInvoiceEvent(services, result.invoice);
+      return json(result);
+    }
+    if (
+      keys.length !== 4 ||
+      keys.some(
+        (key) =>
+          !["transactionHash", "logIndex", "observedBlockNumber", "observedBlockHash"].includes(
+            key,
+          ),
+      )
+    )
+      throw new HttpError(400, "invalid_claim_input");
+    const result = await services.payment.reportPayment(invoiceId, {
+      transactionHash: body.transactionHash,
+      logIndex: body.logIndex,
+      observedBlockNumber: body.observedBlockNumber,
+      observedBlockHash: body.observedBlockHash,
+    });
+    await relatedInvoiceEvent(services, result.invoice);
+    return json(result);
   }
 
   if (request.method === "GET" || request.method === "HEAD") {
@@ -302,6 +350,43 @@ async function adminOverview(services: CheckoutServices) {
   };
 }
 
+async function relatedInvoiceEvent(
+  services: CheckoutServices,
+  invoice: InvoiceJson,
+): Promise<void> {
+  try {
+    // Receipt/reference reads, lookup/admission, and four protected completion calls need thirteen.
+    if (services.chainWebhookKeys && (services.budget?.hasCapacity(13) ?? true)) {
+      await recoverPendingChainTransfers(
+        {
+          chainId: invoice.chainId,
+          tokenAddress: invoice.tokenAddress,
+          recipientAddress: invoice.treasuryAddress,
+          amountUnits: BigInt(invoice.paidAmountUnits),
+        },
+        {
+          kv: services.kv,
+          budget: services.budget,
+          minimumTransferCalls: 3,
+          prepareTransfer: services.payment.prepareChainTransfer,
+          processTransfer: services.payment.processChainTransfer,
+        },
+      );
+    }
+    if (services.wakeups?.ensure && (services.budget?.hasCapacity(9) ?? true)) {
+      await services.wakeups.ensure({
+        kind: "invoice",
+        id: invoice.id,
+        dueAt: Date.parse(invoice.expiresAt),
+        reason: "expiry",
+      });
+    }
+  } catch {
+    // The successful domain response remains valid; the next related event may retry repair.
+    console.error(JSON.stringify({ message: "checkout_related_event_pending" }));
+  }
+}
+
 export async function runHourlyMaintenance(
   services: CheckoutServices,
   deadline = Number.POSITIVE_INFINITY,
@@ -336,34 +421,54 @@ export async function deliverOutbox(
     const events = await services.payment.listOutbox(pageSize);
     for (const event of events) {
       if (Date.now() >= deadline) return;
-      const merchant = await services.merchantAuth.getMerchant(event.payload.merchantId);
-      if (!merchant) {
-        await services.payment.markOutboxFailed(event.id, "merchant_not_found");
-        continue;
-      }
-      try {
-        const target = await services.merchantAuth.resolveWebhookTarget(
-          merchant.settlementWebhookUrl,
-        );
-        const response = await services.webhookSender(
-          target,
-          JSON.stringify({ eventJws: event.compactJws }),
-          AbortSignal.timeout(Math.max(1, Math.min(WEBHOOK_TIMEOUT_MS, deadline - Date.now()))),
-        );
-        if (response.ok) {
-          await services.payment.markOutboxDelivered(event.id);
-        } else {
-          await services.payment.markOutboxFailed(event.id, `webhook_http_${response.status}`);
-        }
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        await services.payment.markOutboxFailed(event.id, reason);
-        console.error("checkout_settlement_webhook_failed", event.id, error);
-      }
+      await deliverSignedOutboxEvent(services, event, deadline);
     }
     remaining -= events.length;
     if (events.length < pageSize) return;
   }
+}
+
+export async function deliverOutboxEvent(
+  services: CheckoutServices,
+  eventId: string,
+  options: { deadline?: number; isCurrent?: () => Promise<boolean> } = {},
+): Promise<void> {
+  const event = await services.payment.getOutboxEvent(eventId);
+  if (!event || (options.isCurrent && !(await options.isCurrent()))) return;
+  await deliverSignedOutboxEvent(services, event, options.deadline ?? Infinity, options.isCurrent);
+}
+
+async function deliverSignedOutboxEvent(
+  services: CheckoutServices,
+  event: SignedOutboxEvent,
+  deadline: number,
+  isCurrent: () => Promise<boolean> = async () => true,
+): Promise<void> {
+  const current = async () => Date.now() < deadline && (await isCurrent());
+  if (!(await current())) return;
+  const merchant = await services.merchantAuth.getMerchant(event.payload.merchantId);
+  if (!(await current())) return;
+  if (!merchant) {
+    await services.payment.markOutboxFailed(event.id, "merchant_not_found");
+    return;
+  }
+  let failure: string | undefined;
+  try {
+    const target = await services.merchantAuth.resolveWebhookTarget(merchant.settlementWebhookUrl);
+    if (!(await current())) return;
+    const response = await services.webhookSender(
+      target,
+      JSON.stringify({ eventJws: event.compactJws }),
+      AbortSignal.timeout(Math.max(1, Math.min(WEBHOOK_TIMEOUT_MS, deadline - Date.now()))),
+    );
+    if (!response.ok) failure = `webhook_http_${response.status}`;
+  } catch (error) {
+    failure = error instanceof Error ? error.message : String(error);
+    console.error("checkout_settlement_webhook_failed", event.id, error);
+  }
+  if (!(await current())) return;
+  if (failure) await services.payment.markOutboxFailed(event.id, failure);
+  else await services.payment.markOutboxDelivered(event.id);
 }
 
 export function withPeerAddress(

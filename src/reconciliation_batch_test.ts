@@ -148,6 +148,10 @@ async function setup(count: number) {
 
 function budgetedKv(kv: Kv, budget: WorkerRequestBudget): Kv {
   return {
+    listPage: (prefix, options) => {
+      budget.reserve();
+      return kv.listPage(prefix, options);
+    },
     get<T>(key: KvKey): Promise<KvEntryMaybe<T>> {
       budget.reserve();
       return kv.get<T>(key);

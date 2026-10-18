@@ -10,6 +10,7 @@ import {
   RpcError,
   TRANSFER_TOPIC,
 } from "../src/rpc.ts";
+import { observeAnvilReadiness } from "./anvil_readiness.ts";
 
 export const ANVIL_CHAIN_ID = 8453 as const;
 export const ANVIL_FORK_BLOCK = 48_933_428;
@@ -19,9 +20,12 @@ export const DEMO_TREASURY_ADDRESS = "0x5DD4d53Df5d2F578c613D09525dE1A7352250143
 
 const BASE_USDC_ADDRESS = CHAIN_CONFIGURATIONS[ANVIL_CHAIN_ID].tokenAddress;
 const FUNDED_USDC_HOLDER = "0x51c72848c68a965f66fa7a88855f9f7784502a7f";
-const STARTUP_ATTEMPTS = 80;
-const RECEIPT_ATTEMPTS = 40;
-const POLL_INTERVAL_MS = 250;
+type AnvilProcess = {
+  stdout: ReadableStream<Uint8Array>;
+  exited: Promise<number>;
+  kill(signal: "SIGTERM"): void;
+};
+type AnvilRequest = <T = unknown>(method: string, params: unknown[]) => Promise<T>;
 
 export type DemoFinality = "network" | "safe" | "finalized";
 
@@ -85,33 +89,41 @@ export class AnvilRpcClient implements RpcClient {
 
 export class AnvilBaseFork {
   readonly rpc = new AnvilRpcClient();
-  #process: Bun.Subprocess<"ignore", "ignore", "inherit"> | null = null;
+  #process: AnvilProcess | null = null;
+  #drained: Promise<void> | undefined;
+  #pendingTransfers = new Map<string, string>();
+
+  constructor(
+    private readonly options: { spawn?: () => AnvilProcess; request?: AnvilRequest } = {},
+  ) {}
+
+  #request<T = unknown>(method: string, params: unknown[]): Promise<T> {
+    return (this.options.request ?? rpcRequest)<T>(method, params);
+  }
 
   async start(): Promise<void> {
     if (this.#process) return;
-    if (await rpcAvailable()) {
-      throw new Error(`Anvil demo port is already in use: ${ANVIL_RPC_URL}`);
-    }
     try {
-      this.#process = Bun.spawn({
-        cmd: [
-          "anvil",
-          "--fork-url",
-          BASE_FORK_URL,
-          "--fork-block-number",
-          String(ANVIL_FORK_BLOCK),
-          "--chain-id",
-          String(ANVIL_CHAIN_ID),
-          "--host",
-          "127.0.0.1",
-          "--port",
-          new URL(ANVIL_RPC_URL).port,
-          "--silent",
-        ],
-        stdin: "ignore",
-        stdout: "ignore",
-        stderr: "inherit",
-      });
+      this.#process =
+        this.options.spawn?.() ??
+        Bun.spawn({
+          cmd: [
+            "anvil",
+            "--fork-url",
+            BASE_FORK_URL,
+            "--fork-block-number",
+            String(ANVIL_FORK_BLOCK),
+            "--chain-id",
+            String(ANVIL_CHAIN_ID),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            new URL(ANVIL_RPC_URL).port,
+          ],
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "inherit",
+        });
     } catch (error) {
       if (!Bun.which("anvil")) {
         throw new Error("Anvil is required. Install Foundry from https://getfoundry.sh/.", {
@@ -121,22 +133,22 @@ export class AnvilBaseFork {
       throw error;
     }
 
-    for (let attempt = 0; attempt < STARTUP_ATTEMPTS; attempt++) {
-      try {
-        const chainId = await rpcRequest<string>("eth_chainId", []);
-        const blockNumber = await rpcRequest<string>("eth_blockNumber", []);
-        if (
-          BigInt(chainId) === BigInt(ANVIL_CHAIN_ID) &&
-          BigInt(blockNumber) === BigInt(ANVIL_FORK_BLOCK)
-        )
-          return;
-      } catch {
-        // Anvil is still starting and loading the pinned Base state.
+    const observed = observeAnvilReadiness(this.#process.stdout, this.#process.exited);
+    this.#drained = observed.drained;
+    try {
+      await observed.ready;
+      const chainId = await this.#request<string>("eth_chainId", []);
+      const blockNumber = await this.#request<string>("eth_blockNumber", []);
+      if (
+        BigInt(chainId) !== BigInt(ANVIL_CHAIN_ID) ||
+        BigInt(blockNumber) !== BigInt(ANVIL_FORK_BLOCK)
+      ) {
+        throw new Error("anvil_pinned_fork_mismatch");
       }
-      await delay(POLL_INTERVAL_MS);
+    } catch (error) {
+      await this.stop();
+      throw error;
     }
-    await this.stop();
-    throw new Error("Anvil did not load the pinned Base fork within 20 seconds.");
   }
 
   setFinality(finality: DemoFinality): void {
@@ -145,53 +157,81 @@ export class AnvilBaseFork {
 
   async mine(blocks: number): Promise<void> {
     if (!Number.isSafeInteger(blocks) || blocks < 1) throw new Error("invalid_anvil_block_count");
-    await rpcRequest("anvil_mine", [`0x${blocks.toString(16)}`]);
+    await this.#request("anvil_mine", [`0x${blocks.toString(16)}`]);
   }
 
   async snapshot(): Promise<string> {
-    return await rpcRequest<string>("evm_snapshot", []);
+    return await this.#request<string>("evm_snapshot", []);
   }
 
   async revert(snapshotId: string): Promise<void> {
-    const reverted = await rpcRequest<boolean>("evm_revert", [snapshotId]);
+    const reverted = await this.#request<boolean>("evm_revert", [snapshotId]);
     if (!reverted) throw new Error("anvil_snapshot_revert_failed");
   }
 
   async sendExactUsdc(recipientInput: string, amountUnits: bigint): Promise<AnvilTransfer> {
     const recipient = normalizeAddress(recipientInput);
     if (amountUnits <= 0n) throw new Error("invalid_demo_transfer_amount");
+    const transferKey = `${recipient}:${amountUnits}`;
+    const pendingHash = this.#pendingTransfers.get(transferKey);
+    if (pendingHash) return this.#readTransfer(transferKey, pendingHash, recipient, amountUnits);
     const balance = await this.usdcBalance(FUNDED_USDC_HOLDER);
     if (balance < amountUnits) throw new Error("pinned_usdc_holder_balance_too_low");
 
-    await rpcRequest("anvil_impersonateAccount", [FUNDED_USDC_HOLDER]);
+    await this.#request("anvil_impersonateAccount", [FUNDED_USDC_HOLDER]);
     try {
-      await rpcRequest("anvil_setBalance", [FUNDED_USDC_HOLDER, "0x56bc75e2d63100000"]);
-      const transactionHash = await rpcRequest<string>("eth_sendTransaction", [
-        {
-          from: FUNDED_USDC_HOLDER,
-          to: BASE_USDC_ADDRESS,
-          gas: "0x493e0",
-          data: transferCalldata(recipient, amountUnits),
-        },
-      ]);
-      const receipt = await waitForReceipt(transactionHash);
-      const log = transferLog(receipt, transactionHash, recipient, amountUnits);
-      return {
-        transactionHash: normalizeHash(transactionHash),
-        blockNumber: parseQuantity(receipt.blockNumber, "invalid_demo_receipt_block"),
-        blockHash: normalizeHash(receipt.blockHash),
-        logIndex: Number(parseQuantity(log.logIndex, "invalid_demo_log_index")),
-        payerAddress: FUNDED_USDC_HOLDER,
-      };
+      await this.#request("anvil_setBalance", [FUNDED_USDC_HOLDER, "0x56bc75e2d63100000"]);
+      const transactionHash = normalizeHash(
+        await this.#request<string>("eth_sendTransaction", [
+          {
+            from: FUNDED_USDC_HOLDER,
+            to: BASE_USDC_ADDRESS,
+            gas: "0x493e0",
+            data: transferCalldata(recipient, amountUnits),
+          },
+        ]),
+      );
+      this.#pendingTransfers.set(transferKey, transactionHash);
+      return await this.#readTransfer(transferKey, transactionHash, recipient, amountUnits);
     } finally {
-      await rpcRequest("anvil_stopImpersonatingAccount", [FUNDED_USDC_HOLDER]).catch(() => {});
+      await this.#request("anvil_stopImpersonatingAccount", [FUNDED_USDC_HOLDER]).catch(() => {});
     }
+  }
+
+  async #readTransfer(
+    transferKey: string,
+    transactionHash: string,
+    recipient: string,
+    amountUnits: bigint,
+  ): Promise<AnvilTransfer> {
+    const receipt = await this.#request<Record<string, unknown> | null>(
+      "eth_getTransactionReceipt",
+      [transactionHash],
+    );
+    if (!receipt)
+      throw new Error(
+        `demo_usdc_receipt_pending:${transactionHash}; retry the transfer step to check this transaction`,
+      );
+    if (parseQuantity(receipt.status, "invalid_demo_receipt_status") !== 1n) {
+      this.#pendingTransfers.delete(transferKey);
+      throw new Error("demo_usdc_transfer_failed");
+    }
+    const log = transferLog(receipt, transactionHash, recipient, amountUnits);
+    const transfer = {
+      transactionHash,
+      blockNumber: parseQuantity(receipt.blockNumber, "invalid_demo_receipt_block"),
+      blockHash: normalizeHash(receipt.blockHash),
+      logIndex: Number(parseQuantity(log.logIndex, "invalid_demo_log_index")),
+      payerAddress: FUNDED_USDC_HOLDER,
+    };
+    this.#pendingTransfers.delete(transferKey);
+    return transfer;
   }
 
   async usdcBalance(addressInput: string): Promise<bigint> {
     const address = normalizeAddress(addressInput);
     const data = `0x70a08231${address.slice(2).padStart(64, "0")}`;
-    const result = await rpcRequest<string>("eth_call", [
+    const result = await this.#request<string>("eth_call", [
       { to: BASE_USDC_ADDRESS, data },
       "latest",
     ]);
@@ -208,6 +248,9 @@ export class AnvilBaseFork {
       // It may already have exited after reporting its startup error.
     }
     await process.exited.catch(() => {});
+    await this.#drained;
+    this.#drained = undefined;
+    this.#pendingTransfers.clear();
   }
 }
 
@@ -227,31 +270,6 @@ async function rpcRequest<T = unknown>(method: string, params: unknown[]): Promi
   }
   if (!("result" in body)) throw new Error("anvil_rpc_result_missing");
   return body.result as T;
-}
-
-async function rpcAvailable(): Promise<boolean> {
-  try {
-    await rpcRequest("eth_chainId", []);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function waitForReceipt(transactionHash: string): Promise<Record<string, unknown>> {
-  for (let attempt = 0; attempt < RECEIPT_ATTEMPTS; attempt++) {
-    const receipt = await rpcRequest<Record<string, unknown> | null>("eth_getTransactionReceipt", [
-      transactionHash,
-    ]);
-    if (receipt) {
-      if (parseQuantity(receipt.status, "invalid_demo_receipt_status") !== 1n) {
-        throw new Error("demo_usdc_transfer_failed");
-      }
-      return receipt;
-    }
-    await delay(POLL_INTERVAL_MS);
-  }
-  throw new Error("demo_usdc_receipt_timeout");
 }
 
 function transferLog(
@@ -299,8 +317,4 @@ function normalizeHash(value: unknown): string {
     throw new Error("invalid_demo_hash");
   }
   return value.toLowerCase();
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

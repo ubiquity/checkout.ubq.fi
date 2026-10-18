@@ -22,16 +22,16 @@ Record runtime/storage/trust decisions and update AGENTS runtime policy and chec
 
 ## 2. Split portable logic from runtime adapters
 
-| Existing Deno surface        | Bun/local replacement                                                      | Worker replacement                                                                                             |
-| ---------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `Deno.serve`                 | `Bun.serve`, actual `server.requestIP()`, owned `server.stop()` lifecycle. | Exported `fetch` handler with request-local services and generated binding types.                              |
-| `Deno.openKv` and KV globals | Explicit store interface; isolated Bun SQLite adapter.                     | Existing transactional service/database adapter selected by semantics.                                         |
-| Asset filesystem reads       | Inject a local asset reader.                                               | `ASSETS.fetch`, exact routes/HEAD behavior, preserved CSP/cache headers, and appropriate Worker-first routing. |
-| Environment/arguments        | Explicit process/Bun configuration at the local entry.                     | Handler bindings; no import-time credential or I/O assumptions.                                                |
-| DNS/TLS sockets              | Bun transport preserving required DNS, certificate, and peer checks.       | Native platform transport with its documented enforcement boundary and real runtime proof.                     |
-| Cron/timers                  | Explicitly owned optional local timer.                                     | Awaited `scheduled` work with bounded durable progress.                                                        |
-| Child processes/signals      | `Bun.spawn`, signal handlers, and complete cleanup.                        | Keep local demos/tool subprocesses outside the Worker runtime.                                                 |
-| Tests and deployment scripts | Native `bun:test`, local helpers, locked Bun tooling.                      | Actual workerd tests and official Cloudflare packaging/deployment tooling.                                     |
+| Existing Deno surface        | Bun/local replacement                                                                               | Worker replacement                                                                                             |
+| ---------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `Deno.serve`                 | `Bun.serve`, actual `server.requestIP()`, owned `server.stop()` lifecycle.                          | Exported `fetch` handler with request-local services and generated binding types.                              |
+| `Deno.openKv` and KV globals | Explicit store interface; isolated Bun SQLite adapter.                                              | Existing transactional service/database adapter selected by semantics.                                         |
+| Asset filesystem reads       | Inject a local asset reader.                                                                        | `ASSETS.fetch`, exact routes/HEAD behavior, preserved CSP/cache headers, and appropriate Worker-first routing. |
+| Environment/arguments        | Explicit process/Bun configuration at the local entry.                                              | Handler bindings; no import-time credential or I/O assumptions.                                                |
+| DNS/TLS sockets              | Bun transport preserving required DNS, certificate, and peer checks.                                | Native platform transport with its documented enforcement boundary and real runtime proof.                     |
+| Event work                   | Durable local KV delayed queue; atomic job/due-index/domain writes and finite per-startup adoption. | SQLite DOs for original safe/finalized/merchant-retry or separate finite expiry work; no cron or hunt timer.   |
+| Child processes/signals      | `Bun.spawn`, signal handlers, and complete cleanup.                                                 | Keep local demos/tool subprocesses outside the Worker runtime.                                                 |
+| Tests and deployment scripts | Native `bun:test`, local helpers, locked Bun tooling.                                               | Actual workerd tests and official Cloudflare packaging/deployment tooling.                                     |
 
 Convert test objects/substeps and assertions while preserving isolation, timeouts, and cleanup. Replace obsolete deployment scripts/workflows.
 
@@ -70,15 +70,15 @@ Prove TLS behavior on the actual public entrypoint. Checkout's transport probe o
 
 ## 5. Make background progress durable under free limits
 
-Confirm current limits and account-wide usage before adding schedules. The verified Workers Free reference has 10 ms CPU per invocation, 50 external subrequests, and 100,000 daily requests shared across the account; repositories and Workers do not multiply that allowance. Budget aggregate existing traffic and cron usage. Report behavior that exceeds the authorized free design without adding paid prerequisites.
+Confirm current limits and account-wide usage before adding event work. Workers Free has 10 ms HTTP CPU, 50 external subrequests and 100,000 daily account requests, with a separate service-binding ceiling of 32 Worker invocations. SQLite DOs have their own default CPU/duration and daily allocations. Network waiting is not active CPU, but batched JSON parsing and retained data consume CPU/memory. Do not add paid prerequisites or claim unlimited capacity.
 
-Count attempted storage, DNS, RPC, asset, and webhook I/O in a conservative application budget, and enforce an elapsed deadline. Stop with unfinished work retryable. A deadline does not increase the platform CPU allowance.
+Runtime limits are Worker HTTP 30 charged slots, entity alarm 28, migration ensure 24 and nested adopt 7. Nested allowances are reserved INSIDE the caller envelope with completion capacity protected, not added after 30. The native manual HTTP ledger used 28 actual root calls (23 storage, 3 RPC, 2 bindings), leaving 2 slots. A separate HTTP row used 21 actual root calls plus a reserved 7-call nested upper bound, leaving 2; adding the entry yields a conservative bound of 29. Seven is a reservation, not observed nested traffic. The harness bounds actual calls plus reserved nested plus entry at32 and actual calls at50 across recorded contexts; printed detailed rows are HTTP only. Do not sum independent alarms or claim exact nested attribution beyond these bounds. Live CPU/quota capacity remains unproved. Reserve canonical verification, completion/CAS and scheduling before log work.
 
-Persist bounded scan ranges and fair work selection. Checkout separates a CAS-protected per-chain invoice rotation pointer from each invoice's scan cursor: rotation prevents a failing invoice from starving later ones; scan progress commits only after completed work.
+Use one event-triggered hunt for all unresolved attempts of the authenticated merchant/customerReference account, grouped by chain and historical token/treasury. Capture numeric latest and batch disjoint <=1000-block standard eth_getLogs requests with unique IDs. Correlate out-of-order responses by ID, retain successful chunks, retry failed/missing entries once within the reserve, and split only size evidence within byte/entry/call caps. HTTP/non-array failure fails the sent batch; do not send empty batches or use provider-specific transfer methods. Report incomplete account enumeration, exact holes and contiguous searchedToBlock rather than hiding a failed middle range or promising arbitrary-span completion.
 
-The reference cron runs every minute: 1,440 ticks/day, three-chain rotation, at most one outbox event and one invoice per tick, up to 1,000 blocks with 128-block overlap, a 24-call budget, and a 20-second deadline. HTTP uses a 40-call budget. Each chain gets a turn every three minutes; total backlog determines per-invoice completion time.
+UI expiry does not end candidacy. Invalidate earlier unpaid attempts and release active reservations only after complete relevant coverage, canonical checks and currentness fences; protect confirming payments. Retain historical amount ownership permanently. Ambiguous cross-account reuse becomes manual review with no automatic credit, while exact locator ownership wins. Unmatched relevant observations are retained, not silently discarded. Confirm at latest and credit only at actual safe/finalized evidence.
 
-Keep exactly one hosted scheduler active during cutover and rollback. Request-local services, in-memory locks, or multiple timers do not establish cross-isolate ownership.
+No cron, interval sweep, periodic backstop/retention/repair or hunt alarm is allowed. Safe/finalized and merchant retries are finite original jobs; expiry is ONE separate finite per-invoice backup to captured latest that does not resolve the attempt. Worker migration runs bounded ordinary-request slices; Bun performs finite per-startup account/job adoption. Use durable fences and preserve codec-compatible state during cutover/rollback; no old timer may be restored. Terminal invoice statuses alone do not prove global quiescence. A budgeted request can leave an unadopted COMMITTED wake intent for that target. Only the target's related request or its already registered original alarm advances bounded adoption/ACK/retirement; unrelated requests do not sweep other entities. Quiet is asserted after all legitimate jobs and per-target committed intents are adopted/retired, without a new cleanup timer or history deletion.
 
 ## 6. Validate the complete candidate
 
@@ -88,16 +88,15 @@ The Checkout script contract is:
 bun install --frozen-lockfile
 bun run deploy:types
 bun --no-env-file run check
-bun --no-env-file run test:anvil
 bun --no-env-file run deploy:dry-run
 ```
 
-`check` includes `fmt`, `lint`, `typecheck`, `test`, and `test:workers`; `test:anvil` is networked. Local commands are `bun run dev`, `bun run start`, and `bun run demo`. Verify each repository's exact scripts.
+`check` includes `fmt`, `lint`, `typecheck`, `test`, and `test:workers`. Automatic push/PR quality CI uses offline fakes/local workerd and does not run a public fork. The separate `bun --no-env-file run test:anvil` command is optional, networked and requires explicit selection. Local commands are `bun run dev`, `bun run start`, and `bun run demo`. Verify each repository's exact scripts.
 
 - Offline tests must cover state conflicts, codec/legacy reads, TTL/ranges/indexes, canonical payment verification, auth/scopes, idempotency, retries, and interrupted progress.
 - Real Bun listener/TLS tests must exercise socket-derived trust, proxy handling, certificate failures, exact request bytes, and zero application bytes before rejected peer approval.
-- Actual workerd tests must execute the real entrypoint, configured flags, binding protocol, assets/security headers, auth redirects, protected API behavior, persistent signing identity, and scheduled work with isolated upstreams.
-- Where the product uses a local chain demo, verify its real fork lifecycle and reorg behavior. Scope transactions to the local fork, verify the official tool release, bound processes, and settle listeners/children.
+- Actual workerd tests must execute the real entrypoint, configured flags, binding protocol, assets/security headers, auth redirects, protected API behavior, persistent signing identity, and event-only alarm/account-hunt behavior with isolated upstreams.
+- When an explicitly selected networked demo acceptance is authorized, verify its real fork lifecycle and reorg behavior. Scope transactions to the local fork, verify the official tool release, bound processes, and settle listeners/children.
 - Run the repository's complete gate after writers settle, inspect the deployment artifact, and complete its actual local review. Focused tests, mocks, and a dry-run prove distinct surfaces.
 
 Retain commands/actions, exit/status, tested revision/config, executed-versus-cached status, and result references. Reuse unchanged evidence; rerun when inputs change or acceptance remains unresolved.

@@ -1,44 +1,54 @@
-import { createCheckoutServices, createHandler, runHourlyMaintenance } from "./main.ts";
+import { createCheckoutServices, createHandler } from "./main.ts";
 import { bunServiceOptions, openCheckoutKv, withBunIngress } from "./src/bun_runtime.ts";
+import { BunDelayedQueue } from "./src/bun_queue.ts";
+import { createEntityJobRunner } from "./src/entity_jobs.ts";
 import type { Kv } from "./src/kv.ts";
 
 export function startCheckoutServer(options: { kv?: Kv; port?: number; hostname?: string } = {}) {
   const kv = options.kv ?? openCheckoutKv();
-  const services = createCheckoutServices(kv, bunServiceOptions);
+  const queue = new BunDelayedQueue({ kv, runner: () => jobs });
+  const services = createCheckoutServices(kv, {
+    ...bunServiceOptions,
+    wakeups: queue,
+    chainWebhookKeys: process.env.CHECKOUT_ALCHEMY_WEBHOOK_KEYS,
+  });
+  const jobs = createEntityJobRunner(services);
   const handler = createHandler(services);
+  const requests = new Set<Promise<Response>>();
   try {
+    const ready = queue.start();
+    void ready.catch((error) => console.error("checkout_queue_start_failed", error));
     const server = Bun.serve({
       port: options.port ?? parsePort(process.env.PORT),
       hostname: options.hostname,
       fetch(request, server) {
-        return handler(withBunIngress(request, server.requestIP(request)?.address ?? ""));
+        const response = (async () => {
+          await queue.start();
+          return handler(withBunIngress(request, server.requestIP(request)?.address ?? ""));
+        })();
+        requests.add(response);
+        void response.then(
+          () => requests.delete(response),
+          () => requests.delete(response),
+        );
+        return response;
       },
     });
-    let running: Promise<void> | undefined;
-    const intervalMs = Number(process.env.CHECKOUT_MAINTENANCE_INTERVAL_MS ?? "");
-    const interval =
-      Number.isSafeInteger(intervalMs) && intervalMs > 0
-        ? setInterval(() => {
-            if (running) return;
-            running = runHourlyMaintenance(services)
-              .catch((error) => console.error("checkout_maintenance_failed", error))
-              .finally(() => {
-                running = undefined;
-              });
-          }, intervalMs)
-        : undefined;
     return {
       server,
       services,
+      queue,
+      ready,
       async close() {
-        if (interval) clearInterval(interval);
+        const settled = queue.close();
         await server.stop(true);
-        await running;
+        await Promise.allSettled([...requests]);
+        await settled;
         kv.close();
       },
     };
   } catch (error) {
-    kv.close();
+    void queue.close().then(() => kv.close());
     throw error;
   }
 }

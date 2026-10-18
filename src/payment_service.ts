@@ -1,5 +1,15 @@
-import type { KvKey, Kv, KvEntryMaybe, KvAtomic } from "./kv.ts";
+import type { KvKey, Kv, KvEntryMaybe, KvAtomic, KvCheck } from "./kv.ts";
+import { confirmationMilestones, type WakeupPort, type WakeTarget } from "./wakeup.ts";
+import { StaleWakeupError } from "./wakeup.ts";
+import type { ChainTransferEvent } from "./chain_events.ts";
+import type { ChainTransferContext } from "./chain_ingress.ts";
 import { type CompactJwsSigner } from "./jws.ts";
+import {
+  discoverInvoicePayment,
+  discoveryStateKey,
+  invoiceMatchesTransfer,
+  type DiscoveryOptions,
+} from "./payment_discovery.ts";
 import {
   catalogVersionKey,
   type Clock,
@@ -39,10 +49,25 @@ import {
   discoverTransferLogs,
   latestBlockNumber,
   type RpcClient,
+  RpcError,
   RpcVerificationError,
   type VerifiedTransfer,
   verifyTransferBatch,
 } from "./rpc.ts";
+import { WorkerBudgetError } from "./worker_budget.ts";
+import {
+  runAccountHunt,
+  resolveTransferAttribution,
+  type AccountHuntJson,
+} from "./account_runtime.ts";
+import {
+  prepareAccountAttempt,
+  adoptAccountIndexSlice,
+  treasuryHistoryKey,
+  ACCOUNT_INDEX_STATE_KEY,
+  type AttemptState,
+} from "./account_store.ts";
+import { legacyAttemptResolution } from "./account_attempts.ts";
 
 const PREFIX: KvKey = ["uos_checkout", "v1", "payments"];
 const INVOICES_PREFIX: KvKey = [...PREFIX, "invoices"];
@@ -61,7 +86,6 @@ const CHAIN_SETTINGS_PREFIX: KvKey = [...PREFIX, "chain_settings"];
 
 const EVENT_ISSUER = "https://checkout.ubq.fi";
 const EVENT_TTL_SECONDS = 24 * 60 * 60;
-const SEALED_BLOCKS_REQUIRED = 3n;
 const RECONCILIATION_OVERLAP_BLOCKS = 128n;
 const OUTBOX_INITIAL_BACKOFF_MS = 60_000;
 const OUTBOX_MAX_BACKOFF_MS = 24 * 60 * 60 * 1000;
@@ -77,6 +101,8 @@ export type PaymentServiceOptions = {
   clock?: Clock;
   idGenerator?: IdGenerator;
   discountStart?: () => bigint;
+  discovery?: DiscoveryOptions;
+  wakeups?: WakeupPort;
 };
 
 export type MerchantContext = {
@@ -104,7 +130,13 @@ export type ClaimPaymentInput = {
 export type ClaimPaymentResult = {
   invoice: InvoiceJson;
   eventJws?: string;
+  discovery?: { found: boolean; searchedToBlock?: string };
+  accountHunt?: AccountHuntJson;
 };
+
+function hasCurrentPaymentRecord(invoice: Pick<InvoiceRecord, "paymentId" | "status">): boolean {
+  return Boolean(invoice.paymentId) && invoice.status !== "reverted";
+}
 
 type OpenInvoiceIndex = {
   invoiceId: string;
@@ -122,6 +154,13 @@ type LocatorIndex = {
   invoiceId: string;
   paymentId: string;
   duplicate: boolean;
+};
+
+type ClaimSnapshot = {
+  invoiceEntry?: KvEntryMaybe<InvoiceRecord>;
+  locatorEntry?: KvEntryMaybe<LocatorIndex>;
+  paymentEntry?: KvEntryMaybe<PaymentRecord>;
+  attributed?: boolean;
 };
 
 type ReconciliationCursor = {
@@ -154,6 +193,24 @@ export function createPaymentService(options: PaymentServiceOptions) {
   const clock = options.clock ?? systemClock;
   const idGenerator = options.idGenerator ?? { next: () => crypto.randomUUID() };
   const discountStart = options.discountStart ?? randomDiscountStart;
+  function verificationRpc(context?: ChainTransferContext, completionCalls = 5): RpcClient {
+    return {
+      async batch(chainId, calls, limits) {
+        const headRetry = calls.every(({ id }) => ["latest", "safe", "finalized"].includes(id));
+        if (headRetry && context && !(await context.isCurrent())) throw new StaleWakeupError();
+        const budget = context?.budget ?? options.discovery?.budget;
+        if (
+          calls.every(({ id }) => id === "safe" || id === "finalized") &&
+          budget &&
+          // Fenced ingress can also read its receipt before each of the three commit phases.
+          !budget.hasCapacity(completionCalls + 1 + (context ? 3 : 0))
+        ) {
+          return calls.map(({ id }) => ({ jsonrpc: "2.0", id, result: null }));
+        }
+        return rpc.batch(chainId, calls, limits);
+      },
+    };
+  }
   return {
     publishCatalogVersion: (
       context: MerchantContext,
@@ -167,19 +224,115 @@ export function createPaymentService(options: PaymentServiceOptions) {
     getChainConfiguration: (chainId: unknown) =>
       getChainConfiguration(kv, supportedChainId(chainId)),
     listChainConfigurations: () => listChainConfigurations(kv),
-    createInvoice: (context: InvoiceCreationContext, input: CreateInvoiceInput) =>
-      createInvoice(context, input),
+    createInvoice: async (context: InvoiceCreationContext, input: CreateInvoiceInput) => {
+      const invoice = await createInvoice(context, input);
+      const result = await discoverAccount(invoice.id);
+      return { ...result.invoice, accountHunt: result.accountHunt };
+    },
     getInvoice: async (invoiceId: unknown) => invoiceJson(await invoiceRecord(kv, invoiceId)),
     listInvoices: (limit?: number) => listInvoices(kv, limit),
     getInvoiceRecord: (invoiceId: unknown) => invoiceRecord(kv, invoiceId),
     claimPayment: (invoiceId: unknown, input: ClaimPaymentInput) => claimPayment(invoiceId, input),
+    reportPayment: async (invoiceId: unknown, input: ClaimPaymentInput) => {
+      const signed: { value?: { result: ClaimPaymentResult; versionstamp: string | null } } = {};
+      await claimPayment(invoiceId, input, undefined, undefined, (event) => {
+        signed.value = event;
+      });
+      return discoverAccount(invoiceId, undefined, undefined, false, false, signed.value);
+    },
+    processChainTransfer: async (event: ChainTransferEvent, context: ChainTransferContext) => {
+      return processChainTransfer(event, context);
+    },
+    prepareChainTransfer: async (event: ChainTransferEvent, context: ChainTransferContext) => {
+      // A negative inclusion hint belongs to canonical reorg handling below, not a positive search.
+      if (event.removed) return true;
+      if (!(context.budget?.hasCapacity(6) ?? true)) return false;
+      const [reservation, locator, index] = await kv.getMany<
+        [AmountReservation, LocatorIndex, { complete: boolean }]
+      >([
+        amountReservationKey(
+          event.chainId,
+          event.tokenAddress,
+          event.recipientAddress,
+          event.amountUnits,
+        ),
+        paymentLocatorKey(event.chainId, event.transactionHash, event.logIndex),
+        ACCOUNT_INDEX_STATE_KEY,
+      ]);
+      const id = locator.value?.invoiceId ?? reservation.value?.invoiceId;
+      if (!id) return true;
+      const anchor = await kv.get<InvoiceRecord>(invoiceKey(id));
+      if (
+        !anchor.value ||
+        anchor.value.treasuryAddress.toLowerCase() !== event.recipientAddress.toLowerCase()
+      )
+        return true;
+      if (event.removed) {
+        const payment = anchor.value.paymentId
+          ? (await kv.get<PaymentRecord>(paymentKey(anchor.value.paymentId))).value
+          : null;
+        if (
+          !payment ||
+          payment.transactionHash !== event.transactionHash ||
+          payment.logIndex !== event.logIndex ||
+          payment.blockNumber !== event.blockNumber ||
+          payment.blockHash !== event.blockHash
+        )
+          return true;
+      }
+      const result = await discoverAccount(
+        id,
+        { ...context, fences: [...(context.fences ?? []), index] },
+        anchor,
+        true,
+        index.value?.complete === true,
+      );
+      return result.accountHunt?.complete === true;
+    },
+    discoverPayment: (
+      invoiceId: unknown,
+      search?: Pick<DiscoveryOptions, "expiryToBlock" | "isCurrent">,
+    ) =>
+      search?.expiryToBlock === undefined
+        ? discoverAccount(invoiceId)
+        : discoverInvoicePayment(
+            {
+              kv,
+              rpc,
+              clock,
+              claim: (id, input, invoiceEntry) =>
+                claimPayment(
+                  id,
+                  input,
+                  search?.expiryToBlock === undefined
+                    ? undefined
+                    : {
+                        budget: options.discovery?.budget,
+                        deadline: options.discovery?.deadline ?? Date.now() + 20_000,
+                        isCurrent: search.isCurrent ?? (async () => true),
+                      },
+                  { invoiceEntry },
+                ),
+              existingEvent: signedExistingEvent,
+            },
+            invoiceId,
+            { ...options.discovery, ...search },
+          ),
     refreshInvoice: (invoiceId: unknown) => refreshInvoice(invoiceId),
     expireInvoice: (invoiceId: unknown) => expireInvoice(invoiceId),
     markManualReview: (invoiceId: unknown) => markManualReview(invoiceId),
     listOutbox: (limit?: number) => listOutbox(kv, signer, clock, limit),
-    markOutboxDelivered: (eventId: unknown) => markOutboxDelivered(kv, eventId, clock),
+    getOutboxEventRecord: (eventId: unknown) => getOutboxEventRecord(kv, eventId),
+    getOutboxEvent: async (eventId: unknown): Promise<SignedOutboxEvent | null> => {
+      const event = await getOutboxEventRecord(kv, eventId);
+      if (!event || event.deliveredAt || Date.parse(event.nextAttemptAt) > clock.now().getTime())
+        return null;
+      return { ...event, compactJws: await signEventForDelivery(signer, event, clock.now()) };
+    },
+    markOutboxDelivered: (eventId: unknown) =>
+      markOutboxDelivered(kv, eventId, clock, options.wakeups),
     markOutboxFailed: (eventId: unknown, reason: unknown) =>
-      markOutboxFailed(kv, eventId, reason, clock),
+      markOutboxFailed(kv, eventId, reason, clock, options.wakeups),
     listReconciliationInvoices: (chainId: unknown) =>
       listReconciliationInvoices(kv, supportedChainId(chainId), clock),
     reconcileChainRange: (
@@ -191,6 +344,368 @@ export function createPaymentService(options: PaymentServiceOptions) {
       reconcileHourly(supportedChainId(chainId), toBlock),
     jwks: () => signer.jwks(),
   };
+
+  async function commitInvoice(
+    atomic: KvAtomic,
+    invoice: InvoiceRecord,
+    event?: OutboxEventRecord,
+    evidence?: VerifiedTransfer,
+    context?: ChainTransferContext,
+  ) {
+    if (context?.fence) atomic.check(context.fence);
+    if (context?.fences) atomic.check(...context.fences);
+    if (!options.wakeups) {
+      if (context && !(await context.isCurrent())) throw new StaleWakeupError();
+      return atomic.commit();
+    }
+    let target: WakeTarget = { kind: "invoice", id: invoice.id, dueAt: null, reason: "cancel" };
+    if (invoice.status === "awaiting_payment") {
+      target = { ...target, dueAt: Date.parse(invoice.expiresAt), reason: "expiry" };
+    } else if (
+      invoice.paymentId &&
+      !invoice.requiresManualReview &&
+      ["confirming", "provisionally_paid", "settled"].includes(invoice.status)
+    ) {
+      if (!evidence) throw new PaymentDomainError("confirmation_evidence_required");
+      const times = confirmationMilestones(invoice.chainId, evidence.blockTimestamp.getTime());
+      const expected = invoice.status === "settled" ? times.finalizedAt : times.safeAt;
+      target = {
+        ...target,
+        dueAt: Math.max(clock.now().getTime(), expected),
+        reason: "confirmation",
+      };
+    }
+    return options.wakeups.commit(
+      atomic,
+      [
+        target,
+        ...(event
+          ? [
+              {
+                kind: "delivery" as const,
+                id: event.id,
+                dueAt: Date.parse((event as DeliveryEventRecord).nextAttemptAt),
+                reason: "delivery" as const,
+              },
+            ]
+          : []),
+      ],
+      context?.isCurrent,
+    );
+  }
+
+  async function discoverAccount(
+    invoiceIdInput: unknown,
+    context?: ChainTransferContext,
+    suppliedAnchor?: KvEntryMaybe<InvoiceRecord>,
+    reuseComplete = false,
+    indexReady = false,
+    signed?: { result: ClaimPaymentResult; versionstamp: string | null },
+  ): Promise<ClaimPaymentResult> {
+    const invoiceId = boundedText(invoiceIdInput, "invoice_id", 128);
+    const anchor = suppliedAnchor ?? (await kv.get<InvoiceRecord>(invoiceKey(invoiceId)));
+    if (!anchor.value) throw new PaymentDomainError("invoice_not_found");
+    const refreshedAnchor: { value?: ClaimPaymentResult; versionstamp?: string | null } = signed
+      ? { value: signed.result, versionstamp: signed.versionstamp }
+      : {};
+    const result = await runAccountHunt({
+      kv,
+      rpc,
+      anchor,
+      budget: context?.budget ?? options.discovery?.budget,
+      deadline: context?.deadline ?? options.discovery?.deadline,
+      context,
+      reuseComplete,
+      indexReady,
+      verifyCredit: async (entry, scope) => {
+        if (!entry.value?.paymentId || legacyAttemptResolution(entry.value) !== "credited")
+          return null;
+        const payment = await kv.get<PaymentRecord>(paymentKey(entry.value.paymentId));
+        if (!payment.value || !(await scope.isCurrent())) return null;
+        try {
+          const evidence = await verifyTransferBatch(verificationRpc(scope), entry.value.chainId, {
+            transactionHash: payment.value.transactionHash,
+            logIndex: payment.value.logIndex,
+            observedBlockNumber: payment.value.blockNumber,
+            observedBlockHash: payment.value.blockHash,
+            previouslyVerifiedBlockHash: payment.value.blockHash,
+            tokenAddress: entry.value.tokenAddress,
+            recipientAddress: entry.value.treasuryAddress,
+            amountUnits: entry.value.paidAmountUnits,
+          });
+          return ((evidence.safeBlock !== null && evidence.safeBlock >= evidence.blockNumber) ||
+            (evidence.finalizedBlock !== null &&
+              evidence.finalizedBlock >= evidence.blockNumber)) &&
+            (await scope.isCurrent())
+            ? [entry, payment]
+            : null;
+        } catch {
+          return null;
+        }
+      },
+      claim: async (entry, log, scope, attribution) => {
+        await claimPayment(
+          entry.value!.id,
+          {
+            transactionHash: log.transactionHash,
+            logIndex: String(log.logIndex),
+            observedBlockNumber: log.blockNumber.toString(),
+            observedBlockHash: log.blockHash,
+          },
+          scope,
+          { invoiceEntry: entry, locatorEntry: attribution.locator, attributed: true },
+        );
+      },
+      refresh: async (entry, scope) => {
+        const verified: KvCheck[] = [];
+        const refreshed = await refreshInvoice(
+          entry.value!.id,
+          scope,
+          { invoiceEntry: entry },
+          undefined,
+          (checks) => {
+            verified.push(...checks);
+          },
+        );
+        const invoiceProof = verified.find(
+          (check) => JSON.stringify(check.key) === JSON.stringify(entry.key),
+        );
+        if (refreshed.eventJws && refreshed.invoice.id === anchor.value!.id && invoiceProof) {
+          refreshedAnchor.value = refreshed;
+          refreshedAnchor.versionstamp = invoiceProof.versionstamp;
+        }
+        return verified.length ? verified : null;
+      },
+      invalidate: async (entry, state, reservation, scope, checks) => {
+        const next: InvoiceRecord = {
+          ...entry.value!,
+          status: "expired",
+          expiredAt: entry.value!.expiredAt ?? clock.now().toISOString(),
+          updatedAt: clock.now().toISOString(),
+        };
+        let atomic = kv
+          .atomic()
+          .check(entry, state, reservation, ...checks)
+          .set(entry.key, next)
+          .set(state.key, { ...state.value!, resolution: "invalidated" } satisfies AttemptState);
+        if (reservation.value?.invoiceId === next.id) atomic = atomic.delete(reservation.key);
+        return (await commitInvoice(atomic, next, undefined, undefined, scope)).ok;
+      },
+    });
+    const group = result.accountHunt.groups.find(
+      (group) =>
+        group.chainId === anchor.value!.chainId &&
+        group.tokenAddress === anchor.value!.tokenAddress.toLowerCase() &&
+        group.treasuryAddress === anchor.value!.treasuryAddress.toLowerCase(),
+    );
+    const responseBudget = context?.budget ?? options.discovery?.budget;
+    let eventJws =
+      refreshedAnchor.versionstamp === result.anchorVersionstamp &&
+      refreshedAnchor.value?.invoice.paymentId === result.anchor.paymentId &&
+      refreshedAnchor.value?.invoice.status === result.anchor.status &&
+      refreshedAnchor.value?.invoice.acceptedAt === result.anchor.acceptedAt &&
+      refreshedAnchor.value?.invoice.settledAt === result.anchor.settledAt &&
+      refreshedAnchor.value?.invoice.revertedAt === result.anchor.revertedAt
+        ? refreshedAnchor.value?.eventJws
+        : undefined;
+    // Two event-index/record pairs, a cold signing-key read/create, and one cleanup slot.
+    if (
+      !eventJws &&
+      hasCurrentPaymentRecord(result.anchor) &&
+      responseBudget?.hasCapacity(7) !== false
+    ) {
+      const release = responseBudget?.reserveForCompletion(1);
+      try {
+        eventJws = await signedExistingEvent(result.anchor);
+      } catch (error) {
+        if (!(error instanceof WorkerBudgetError)) throw error;
+      } finally {
+        release?.();
+      }
+    }
+    return {
+      invoice: result.anchor,
+      accountHunt: result.accountHunt,
+      discovery: {
+        found: hasCurrentPaymentRecord(result.anchor),
+        ...(group?.searchedToBlock === undefined ? {} : { searchedToBlock: group.searchedToBlock }),
+      },
+      ...(eventJws ? { eventJws } : {}),
+    };
+  }
+
+  async function processChainTransfer(
+    event: ChainTransferEvent,
+    context: ChainTransferContext,
+  ): Promise<{ terminal: boolean; disposition: string; invoiceId?: string }> {
+    const ignored = (invoiceId?: string) => ({ terminal: true, disposition: "ignored", invoiceId });
+    const deferred = (invoiceId?: string) => ({
+      terminal: false,
+      disposition: "deferred",
+      invoiceId,
+    });
+    const room = (calls: number) =>
+      Date.now() < context.deadline && (context.budget?.hasCapacity(calls) ?? true);
+    if (
+      event.tokenAddress.toLowerCase() !==
+      CHAIN_CONFIGURATIONS[event.chainId].tokenAddress.toLowerCase()
+    )
+      return ignored();
+    if (!room(4)) return deferred();
+    const [registeredTreasury, settings] = await kv.getMany<[boolean, PaymentChainSettings]>([
+      treasuryHistoryKey(event.chainId, event.tokenAddress, event.recipientAddress),
+      chainSettingsKey(event.chainId),
+    ]);
+    if (
+      !registeredTreasury.value &&
+      settings.value?.treasuryAddress.toLowerCase() !== event.recipientAddress.toLowerCase()
+    )
+      return ignored();
+    let indexed = await adoptAccountIndexSlice(kv, {
+      budget: context.budget,
+      isCurrent: context.isCurrent,
+    });
+    if (!context.budget)
+      for (let count = 0; !indexed && count < 1000; count++)
+        indexed = await adoptAccountIndexSlice(kv, { isCurrent: context.isCurrent });
+    if (!indexed) return deferred();
+    if (!room(3)) return deferred();
+    const locatorKey = paymentLocatorKey(event.chainId, event.transactionHash, event.logIndex);
+    const [reservation, locator] = await kv.getMany<[AmountReservation, LocatorIndex]>([
+      amountReservationKey(
+        event.chainId,
+        event.tokenAddress.toLowerCase(),
+        event.recipientAddress.toLowerCase(),
+        event.amountUnits,
+      ),
+      locatorKey,
+    ]);
+    const id = locator.value?.invoiceId ?? reservation.value?.invoiceId;
+    if (!id) {
+      const attribution = await resolveTransferAttribution({
+        kv,
+        chainId: event.chainId,
+        log: event,
+        budget: context.budget,
+        context,
+        provenance: "signed_chain_event",
+        removed: event.removed,
+      });
+      return { terminal: attribution.complete, disposition: attribution.classification };
+    }
+    const invoiceEntry = await kv.get<InvoiceRecord>(invoiceKey(id));
+    const invoice = invoiceEntry.value;
+    if (
+      !invoice ||
+      invoice.chainId !== event.chainId ||
+      invoice.minimumBlock > event.blockNumber ||
+      invoice.tokenAddress.toLowerCase() !== event.tokenAddress.toLowerCase() ||
+      invoice.treasuryAddress.toLowerCase() !== event.recipientAddress.toLowerCase() ||
+      invoice.paidAmountUnits !== event.amountUnits
+    )
+      return ignored(id);
+    const paymentEntry = invoice.paymentId
+      ? await kv.get<PaymentRecord>(paymentKey(invoice.paymentId))
+      : undefined;
+    const payment = paymentEntry?.value;
+    const snapshot: ClaimSnapshot = { invoiceEntry, locatorEntry: locator, paymentEntry };
+    const sameTransaction = payment?.transactionHash === event.transactionHash;
+    const sameInclusion =
+      sameTransaction &&
+      payment?.logIndex === event.logIndex &&
+      payment.blockNumber === event.blockNumber &&
+      payment.blockHash === event.blockHash;
+    if (
+      event.removed &&
+      (!sameInclusion || locator.value?.paymentId !== invoice.paymentId || locator.value?.duplicate)
+    )
+      return ignored(id);
+    if (
+      !event.removed &&
+      ((hasCurrentPaymentRecord(invoice) && sameInclusion) || locator.value?.duplicate)
+    ) {
+      if (sameInclusion && !locator.value?.duplicate && options.wakeups?.ensure) {
+        // The signed receipt is attributed to this exact recorded inclusion. Replan
+        // its canonical known-payment job; never wake unrelated notices by pathname.
+        if (!room(11) || !(await context.isCurrent())) return deferred(id);
+        await options.wakeups.ensure({
+          kind: "invoice",
+          id,
+          dueAt: Date.parse(invoice.expiresAt),
+          reason: "expiry",
+        });
+        if (!(await context.isCurrent())) return deferred(id);
+      }
+      return ignored(id);
+    }
+    const additionalTransfer = Boolean(payment && !sameTransaction);
+    const mutationCalls =
+      event.removed || (hasCurrentPaymentRecord(invoice) && sameTransaction && !sameInclusion)
+        ? 12
+        : invoice.status === "reverted" && invoice.paymentId
+          ? 11
+          : 10;
+    if (!room(mutationCalls) || !(await context.isCurrent())) return deferred(id);
+    try {
+      if (
+        event.removed ||
+        (hasCurrentPaymentRecord(invoice) && sameTransaction && !sameInclusion)
+      ) {
+        let uncertain = false;
+        const result = await refreshInvoice(id, context, snapshot, () => {
+          uncertain = true;
+        });
+        if (uncertain) return deferred(id);
+        // Reorg and reinclusion are separate viable receipt phases under the Free budget.
+        if (!event.removed && (!result.invoice.paymentId || result.invoice.status === "reverted"))
+          return deferred(id);
+        return {
+          terminal: true,
+          disposition:
+            result.invoice.status === "reverted" || !result.invoice.paymentId
+              ? "reverted"
+              : "refreshed",
+          invoiceId: id,
+        };
+      }
+      if (
+        !additionalTransfer &&
+        (!invoiceMatchesTransfer(invoice, event) ||
+          ["manual_review", "late_payment", "finalized"].includes(invoice.status))
+      )
+        return ignored(id);
+      const result = await claimPayment(
+        id,
+        {
+          transactionHash: event.transactionHash,
+          logIndex: event.logIndex.toString(),
+          observedBlockNumber: event.blockNumber.toString(),
+          observedBlockHash: event.blockHash,
+        },
+        context,
+        snapshot,
+      );
+      return {
+        terminal: hasCurrentPaymentRecord(result.invoice),
+        disposition: "claimed",
+        invoiceId: id,
+      };
+    } catch (error) {
+      if (
+        error instanceof WorkerBudgetError ||
+        error instanceof RpcError ||
+        error instanceof RpcVerificationError ||
+        error instanceof StaleWakeupError
+      )
+        return deferred(id);
+      if (
+        error instanceof PaymentDomainError &&
+        ["payment_locator_already_claimed", "payment_before_minimum_block"].includes(error.code)
+      )
+        return ignored(id);
+      throw error;
+    }
+  }
 
   async function configureChain(
     chainIdInput: unknown,
@@ -253,33 +768,6 @@ export function createPaymentService(options: PaymentServiceOptions) {
         return invoiceJson(await invoiceRecord(kv, idempotency.value.invoiceId));
       }
 
-      const open = await kv.get<OpenInvoiceIndex>(openKey);
-      if (open.value) {
-        const existing = await kv.get<InvoiceRecord>(invoiceKey(open.value.invoiceId));
-        if (!existing.value || !isOpenInvoiceStatus(existing.value.status)) {
-          await kv.atomic().check(open).delete(openKey).commit();
-          continue;
-        }
-        if (
-          existing.value.status === "awaiting_payment" &&
-          Date.parse(existing.value.expiresAt) <= clock.now().getTime()
-        ) {
-          await expireAwaiting(kv, clock, existing, open, openKey);
-          continue;
-        }
-        if (open.value.requestFingerprint !== requestFingerprint) {
-          throw new PaymentDomainError("open_invoice_conflict");
-        }
-        const committed = await kv
-          .atomic()
-          .check(idempotency)
-          .check(open)
-          .set(idempotencyKeyEntry, open.value)
-          .commit();
-        if (committed.ok) return invoiceJson(existing.value);
-        continue;
-      }
-
       const versionEntry = await kv.get<CatalogVersionRecord>(
         catalogVersionKey(merchant, pricingVersionId),
       );
@@ -311,12 +799,10 @@ export function createPaymentService(options: PaymentServiceOptions) {
           treasuryAddress,
           paidAmountUnits,
         );
-        const [reservation, currentOpen, currentIdempotency] = await Promise.all([
-          kv.get<AmountReservation>(reservationKey),
-          kv.get<OpenInvoiceIndex>(openKey),
-          kv.get<IdempotencyIndex>(idempotencyKeyEntry),
-        ]);
-        if (currentIdempotency.value || currentOpen.value) break;
+        const [reservation, currentOpen, currentIdempotency] = await kv.getMany<
+          [AmountReservation, OpenInvoiceIndex, IdempotencyIndex]
+        >([reservationKey, openKey, idempotencyKeyEntry]);
+        if (currentIdempotency.value) break;
         let reservedInvoice: KvEntryMaybe<InvoiceRecord> | null = null;
         if (reservation.value !== null) {
           if (typeof reservation.value.invoiceId !== "string") {
@@ -370,7 +856,9 @@ export function createPaymentService(options: PaymentServiceOptions) {
           .set(openKey, index)
           .set(idempotencyKeyEntry, index);
         if (reservedInvoice) atomic = atomic.check(reservedInvoice);
-        const committed = await atomic.commit();
+        const prepared = await prepareAccountAttempt(kv, record, true);
+        atomic = prepared.apply(atomic);
+        const committed = await commitInvoice(atomic, record);
         if (committed.ok) return invoiceJson(record);
         continue creationLoop;
       }
@@ -386,9 +874,13 @@ export function createPaymentService(options: PaymentServiceOptions) {
   async function claimPayment(
     invoiceIdInput: unknown,
     input: ClaimPaymentInput,
+    context?: ChainTransferContext,
+    snapshot?: ClaimSnapshot,
+    signed?: (event: { result: ClaimPaymentResult; versionstamp: string | null }) => void,
   ): Promise<ClaimPaymentResult> {
     const invoiceId = boundedText(invoiceIdInput, "invoice_id", 128);
-    const invoiceEntry = await kv.get<InvoiceRecord>(invoiceKey(invoiceId));
+    const invoiceEntry =
+      snapshot?.invoiceEntry ?? (await kv.get<InvoiceRecord>(invoiceKey(invoiceId)));
     if (!invoiceEntry.value) throw new PaymentDomainError("invoice_not_found");
     const invoice = invoiceEntry.value;
     const transactionHash = normalizeTransactionHash(input.transactionHash);
@@ -406,12 +898,51 @@ export function createPaymentService(options: PaymentServiceOptions) {
         ? undefined
         : boundedText(input.observedBlockHash, "observed_block_hash", 66);
     const locatorKey = paymentLocatorKey(invoice.chainId, transactionHash, logIndex);
-    const existingLocator = await kv.get<LocatorIndex>(locatorKey);
-    if (existingLocator.value) {
-      if (existingLocator.value.invoiceId !== invoice.id) {
-        throw new PaymentDomainError("payment_locator_already_claimed");
-      }
-      if (invoice.status === "reverted") {
+    const existingLocator = snapshot?.locatorEntry ?? (await kv.get<LocatorIndex>(locatorKey));
+    if (existingLocator.value && existingLocator.value.invoiceId !== invoice.id) {
+      throw new PaymentDomainError("payment_locator_already_claimed");
+    }
+    if (!snapshot?.attributed && !existingLocator.value) {
+      let ready = await adoptAccountIndexSlice(kv, {
+        budget: context?.budget ?? options.discovery?.budget,
+        isCurrent: context?.isCurrent,
+      });
+      if (!(context?.budget ?? options.discovery?.budget))
+        for (let count = 0; !ready && count < 1000; count++)
+          ready = await adoptAccountIndexSlice(kv);
+      if (!ready) return { invoice: invoiceJson(invoice) };
+      const attribution = await resolveTransferAttribution({
+        kv,
+        chainId: invoice.chainId,
+        invoice,
+        log: {
+          transactionHash,
+          logIndex,
+          blockNumber: observedBlockNumber,
+          blockHash: observedBlockHash ?? `0x${"0".repeat(64)}`,
+          tokenAddress: invoice.tokenAddress,
+          recipientAddress: invoice.treasuryAddress,
+          amountUnits: invoice.paidAmountUnits,
+          payerAddress: `0x${"0".repeat(40)}`,
+        },
+        budget: context?.budget ?? options.discovery?.budget,
+        context,
+        provenance: "wallet_report_unverified",
+      });
+      if (!attribution.complete || attribution.classification !== "owned")
+        return { invoice: invoiceJson(invoice) };
+      context = {
+        budget: context?.budget ?? options.discovery?.budget,
+        deadline: context?.deadline ?? options.discovery?.deadline ?? Date.now() + 20_000,
+        isCurrent: context?.isCurrent ?? (async () => true),
+        fence: context?.fence,
+        fences: [...(context?.fences ?? []), ...(attribution.checks ?? [])],
+      };
+    }
+    if (invoice.status === "reverted" && invoice.paymentId) {
+      const payment =
+        snapshot?.paymentEntry ?? (await kv.get<PaymentRecord>(paymentKey(invoice.paymentId)));
+      if (payment.value?.transactionHash === transactionHash) {
         return reincludeRevertedPayment(
           invoiceEntry,
           existingLocator,
@@ -419,14 +950,27 @@ export function createPaymentService(options: PaymentServiceOptions) {
           logIndex,
           observedBlockNumber,
           observedBlockHash,
+          context,
+          payment,
         );
       }
-      const refreshed = await refreshInvoice(invoice.id);
-      if (refreshed.eventJws) return refreshed;
-      return { ...refreshed, eventJws: await signedExistingEvent(invoice.id) };
+    }
+    if (existingLocator.value) {
+      const checks: KvCheck[] = [];
+      const refreshed = await refreshInvoice(invoice.id, context, undefined, undefined, (proof) => {
+        checks.push(...proof);
+      });
+      if (refreshed.eventJws) {
+        const invoiceProof = checks.find(
+          (check) => JSON.stringify(check.key) === JSON.stringify(invoiceEntry.key),
+        );
+        if (invoiceProof) signed?.({ result: refreshed, versionstamp: invoiceProof.versionstamp });
+        return refreshed;
+      }
+      return { ...refreshed, eventJws: await signedExistingEvent(refreshed.invoice) };
     }
 
-    const evidence = await verifyTransferBatch(rpc, invoice.chainId, {
+    const evidence = await verifyTransferBatch(verificationRpc(context), invoice.chainId, {
       transactionHash,
       logIndex,
       observedBlockNumber,
@@ -440,9 +984,9 @@ export function createPaymentService(options: PaymentServiceOptions) {
     }
 
     if (invoice.paymentId) {
-      return recordDuplicatePayment(invoiceEntry, locatorKey, existingLocator, evidence);
+      return recordDuplicatePayment(invoiceEntry, locatorKey, existingLocator, evidence, context);
     }
-    return recordPrimaryPayment(invoiceEntry, locatorKey, existingLocator, evidence);
+    return recordPrimaryPayment(invoiceEntry, locatorKey, existingLocator, evidence, context);
   }
 
   async function reincludeRevertedPayment(
@@ -452,14 +996,31 @@ export function createPaymentService(options: PaymentServiceOptions) {
     logIndex: number,
     observedBlockNumber: bigint,
     observedBlockHash: string | undefined,
+    context?: ChainTransferContext,
+    cachedPayment?: KvEntryMaybe<PaymentRecord>,
   ): Promise<ClaimPaymentResult> {
     const invoice = invoiceEntry.value!;
-    if (!invoice.paymentId || locatorEntry.value?.paymentId !== invoice.paymentId) {
+    if (!invoice.paymentId) throw new PaymentDomainError("payment_record_not_found");
+    const paymentEntry =
+      cachedPayment ?? (await kv.get<PaymentRecord>(paymentKey(invoice.paymentId)));
+    const payment = paymentEntry.value;
+    if (!payment || payment.transactionHash !== transactionHash)
+      throw new PaymentDomainError("payment_record_not_found");
+    const locatorChanged = payment.logIndex !== logIndex;
+    if (locatorChanged && locatorEntry.value)
+      throw new PaymentDomainError("payment_locator_already_claimed");
+    const previousLocator = locatorChanged
+      ? await kv.get<LocatorIndex>(
+          paymentLocatorKey(invoice.chainId, payment.transactionHash, payment.logIndex),
+        )
+      : locatorEntry;
+    if (
+      previousLocator.value?.invoiceId !== invoice.id ||
+      previousLocator.value?.paymentId !== invoice.paymentId
+    ) {
       throw new PaymentDomainError("payment_record_not_found");
     }
-    const paymentEntry = await kv.get<PaymentRecord>(paymentKey(invoice.paymentId));
-    if (!paymentEntry.value) throw new PaymentDomainError("payment_record_not_found");
-    const evidence = await verifyTransferBatch(rpc, invoice.chainId, {
+    const evidence = await verifyTransferBatch(verificationRpc(context), invoice.chainId, {
       transactionHash,
       logIndex,
       observedBlockNumber,
@@ -475,7 +1036,6 @@ export function createPaymentService(options: PaymentServiceOptions) {
     const timestamp = clock.now().toISOString();
     const headsEntry = await kv.get<ChainHeadRecord>(headKey(invoice.chainId));
     const heads = mergeHeads(invoice.chainId, headsEntry.value, evidence, timestamp);
-    const sealed = heads.latestBlock >= evidence.blockNumber + SEALED_BLOCKS_REQUIRED;
     const openKey = openInvoiceKey(
       invoice.merchant,
       invoice.customerReference,
@@ -483,11 +1043,11 @@ export function createPaymentService(options: PaymentServiceOptions) {
       invoice.chainId,
     );
     const openEntry = await kv.get<OpenInvoiceIndex>(openKey);
-    const conflictingOpen = openEntry.value !== null && openEntry.value.invoiceId !== invoice.id;
+    const conflictingOpen = false;
     const nextInvoice: InvoiceRecord = {
       ...invoice,
-      status: sealed ? "provisionally_paid" : "confirming",
-      acceptedAt: sealed ? timestamp : undefined,
+      status: "confirming",
+      acceptedAt: undefined,
       settledAt: undefined,
       finalizedAt: undefined,
       revertedAt: undefined,
@@ -505,16 +1065,13 @@ export function createPaymentService(options: PaymentServiceOptions) {
       blockNumber: evidence.blockNumber,
       blockHash: evidence.blockHash,
       blockTimestamp: evidence.blockTimestamp.toISOString(),
-      phase: sealed ? "accepted" : "confirming",
-      acceptedAt: sealed ? timestamp : undefined,
+      phase: "confirming",
+      acceptedAt: undefined,
       settledAt: undefined,
       finalizedAt: undefined,
       revertedAt: undefined,
       updatedAt: timestamp,
     };
-    const event = sealed
-      ? await makeEvent("payment.accepted.v1", nextInvoice, nextPayment, timestamp)
-      : undefined;
     let atomic = kv
       .atomic()
       .check(invoiceEntry)
@@ -524,24 +1081,35 @@ export function createPaymentService(options: PaymentServiceOptions) {
       .check(openEntry)
       .set(invoiceKey(invoice.id), nextInvoice)
       .set(paymentKey(nextPayment.id), nextPayment)
+      .delete(discoveryStateKey(invoice.id))
+      .set(locatorEntry.key, {
+        invoiceId: invoice.id,
+        paymentId: invoice.paymentId,
+        duplicate: false,
+      } satisfies LocatorIndex)
       .set(headKey(invoice.chainId), heads)
       .set(invoiceByChainKey(invoice.chainId, invoice.id), invoice.id);
+    if (locatorChanged) atomic = atomic.check(previousLocator).delete(previousLocator.key);
     if (openEntry.value === null) {
       atomic = atomic.set(openKey, {
         invoiceId: invoice.id,
         requestFingerprint: invoiceRequestFingerprint(invoice),
       } satisfies OpenInvoiceIndex);
     }
-    if (event) atomic = addEventMutations(atomic, event);
-    if (!(await atomic.commit()).ok) {
-      return claimPayment(invoice.id, {
-        transactionHash,
-        logIndex: String(logIndex),
-        observedBlockNumber: observedBlockNumber.toString(),
-        observedBlockHash,
-      });
+    if (!(await commitInvoice(atomic, nextInvoice, undefined, evidence, context)).ok) {
+      if (context) throw new StaleWakeupError();
+      return claimPayment(
+        invoice.id,
+        {
+          transactionHash,
+          logIndex: String(logIndex),
+          observedBlockNumber: observedBlockNumber.toString(),
+          observedBlockHash,
+        },
+        context,
+      );
     }
-    return { invoice: invoiceJson(nextInvoice), eventJws: event?.compactJws };
+    return { invoice: invoiceJson(nextInvoice) };
   }
 
   async function recordPrimaryPayment(
@@ -549,6 +1117,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     locatorKey: KvKey,
     locatorEntry: KvEntryMaybe<LocatorIndex>,
     evidence: VerifiedTransfer,
+    context?: ChainTransferContext,
   ): Promise<ClaimPaymentResult> {
     const invoice = invoiceEntry.value!;
     const now = clock.now();
@@ -574,7 +1143,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     };
     const headsEntry = await kv.get<ChainHeadRecord>(headKey(invoice.chainId));
     const heads = mergeHeads(invoice.chainId, headsEntry.value, evidence, timestamp);
-    const includedLate = evidence.blockTimestamp.getTime() >= Date.parse(invoice.expiresAt);
+    const includedLate = false;
     const openKey = openInvoiceKey(
       invoice.merchant,
       invoice.customerReference,
@@ -582,27 +1151,14 @@ export function createPaymentService(options: PaymentServiceOptions) {
       invoice.chainId,
     );
     const openEntry = await kv.get<OpenInvoiceIndex>(openKey);
-    const conflictingOpen =
-      !includedLate && openEntry.value !== null && openEntry.value.invoiceId !== invoice.id;
-    let nextInvoice: InvoiceRecord = {
+    const conflictingOpen = false;
+    const nextInvoice: InvoiceRecord = {
       ...invoice,
       paymentId,
       status: includedLate ? "late_payment" : conflictingOpen ? "manual_review" : "confirming",
       updatedAt: timestamp,
     };
     payment.phase = includedLate ? "late" : conflictingOpen ? "duplicate" : "confirming";
-
-    let event: OutboxEventRecord | undefined;
-    if (
-      !includedLate &&
-      !conflictingOpen &&
-      heads.latestBlock >= evidence.blockNumber + SEALED_BLOCKS_REQUIRED
-    ) {
-      nextInvoice = { ...nextInvoice, status: "provisionally_paid", acceptedAt: timestamp };
-      payment.phase = "accepted";
-      payment.acceptedAt = timestamp;
-      event = await makeEvent("payment.accepted.v1", nextInvoice, payment, timestamp);
-    }
 
     let atomic = kv
       .atomic()
@@ -612,6 +1168,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       .check(openEntry)
       .set(invoiceKey(invoice.id), nextInvoice)
       .set(paymentKey(paymentId), payment)
+      .delete(discoveryStateKey(invoice.id))
       .set(locatorKey, {
         invoiceId: invoice.id,
         paymentId,
@@ -629,17 +1186,21 @@ export function createPaymentService(options: PaymentServiceOptions) {
     if (includedLate || conflictingOpen) {
       atomic = atomic.delete(invoiceByChainKey(invoice.chainId, invoice.id));
     }
-    if (event) atomic = addEventMutations(atomic, event);
-    const committed = await atomic.commit();
+    const committed = await commitInvoice(atomic, nextInvoice, undefined, evidence, context);
     if (!committed.ok) {
-      return claimPayment(invoice.id, {
-        transactionHash: evidence.transactionHash,
-        logIndex: String(evidence.logIndex),
-        observedBlockNumber: evidence.blockNumber.toString(),
-        observedBlockHash: evidence.blockHash,
-      });
+      if (context) throw new StaleWakeupError();
+      return claimPayment(
+        invoice.id,
+        {
+          transactionHash: evidence.transactionHash,
+          logIndex: String(evidence.logIndex),
+          observedBlockNumber: evidence.blockNumber.toString(),
+          observedBlockHash: evidence.blockHash,
+        },
+        context,
+      );
     }
-    return { invoice: invoiceJson(nextInvoice), eventJws: event?.compactJws };
+    return { invoice: invoiceJson(nextInvoice) };
   }
 
   async function recordDuplicatePayment(
@@ -647,6 +1208,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     locatorKey: KvKey,
     locatorEntry: KvEntryMaybe<LocatorIndex>,
     evidence: VerifiedTransfer,
+    context?: ChainTransferContext,
   ): Promise<ClaimPaymentResult> {
     const invoice = invoiceEntry.value!;
     const timestamp = clock.now().toISOString();
@@ -693,26 +1255,34 @@ export function createPaymentService(options: PaymentServiceOptions) {
         duplicate: true,
       } satisfies LocatorIndex);
     if (openEntry.value?.invoiceId === invoice.id) atomic = atomic.check(openEntry).delete(openKey);
-    const committed = await atomic.commit();
+    const committed = await commitInvoice(atomic, nextInvoice, undefined, undefined, context);
     if (!committed.ok) throw new PaymentDomainError("payment_claim_conflict");
     return { invoice: invoiceJson(nextInvoice) };
   }
 
-  async function refreshInvoice(invoiceIdInput: unknown): Promise<ClaimPaymentResult> {
+  async function refreshInvoice(
+    invoiceIdInput: unknown,
+    context?: ChainTransferContext,
+    snapshot?: ClaimSnapshot,
+    inconclusive?: () => void,
+    verified?: (checks: KvCheck[]) => void,
+  ): Promise<ClaimPaymentResult> {
     const invoiceId = boundedText(invoiceIdInput, "invoice_id", 128);
-    const invoiceEntry = await kv.get<InvoiceRecord>(invoiceKey(invoiceId));
+    const invoiceEntry =
+      snapshot?.invoiceEntry ?? (await kv.get<InvoiceRecord>(invoiceKey(invoiceId)));
     if (!invoiceEntry.value) throw new PaymentDomainError("invoice_not_found");
     const invoice = invoiceEntry.value;
     if (!invoice.paymentId) {
       return { invoice: await expireInvoice(invoice.id) };
     }
-    const paymentEntry = await kv.get<PaymentRecord>(paymentKey(invoice.paymentId));
+    const paymentEntry =
+      snapshot?.paymentEntry ?? (await kv.get<PaymentRecord>(paymentKey(invoice.paymentId)));
     if (!paymentEntry.value) throw new PaymentDomainError("payment_record_not_found");
     const payment = paymentEntry.value;
 
     let evidence: VerifiedTransfer;
     try {
-      evidence = await verifyTransferBatch(rpc, invoice.chainId, {
+      evidence = await verifyTransferBatch(verificationRpc(context, 9), invoice.chainId, {
         transactionHash: payment.transactionHash,
         logIndex: payment.logIndex,
         observedBlockNumber: payment.blockNumber,
@@ -724,10 +1294,24 @@ export function createPaymentService(options: PaymentServiceOptions) {
       });
     } catch (error) {
       if (!(error instanceof RpcVerificationError)) throw error;
-      if (!error.canonicalContradiction) return { invoice: invoiceJson(invoice) };
-      return handleReorg(invoiceEntry, paymentEntry, error.code);
+      if (!error.canonicalContradiction) {
+        inconclusive?.();
+        return { invoice: invoiceJson(invoice) };
+      }
+      return handleReorg(invoiceEntry, paymentEntry, error.code, context);
     }
 
+    const reportVerified = (versionstamp?: string) => {
+      if (
+        (evidence.safeBlock !== null && evidence.safeBlock >= evidence.blockNumber) ||
+        (evidence.finalizedBlock !== null && evidence.finalizedBlock >= evidence.blockNumber)
+      ) {
+        verified?.([
+          { key: invoiceEntry.key, versionstamp: versionstamp ?? invoiceEntry.versionstamp },
+          { key: paymentEntry.key, versionstamp: versionstamp ?? paymentEntry.versionstamp },
+        ]);
+      }
+    };
     const timestamp = clock.now().toISOString();
     const headsEntry = await kv.get<ChainHeadRecord>(headKey(invoice.chainId));
     const heads = mergeHeads(invoice.chainId, headsEntry.value, evidence, timestamp);
@@ -737,7 +1321,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
 
     if (
       invoice.status === "confirming" &&
-      heads.latestBlock >= payment.blockNumber + SEALED_BLOCKS_REQUIRED
+      ((heads.safeBlock !== null && heads.safeBlock >= payment.blockNumber) ||
+        (heads.finalizedBlock !== null && heads.finalizedBlock >= payment.blockNumber))
     ) {
       nextInvoice = {
         ...invoice,
@@ -749,8 +1334,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
       event = await makeEvent("payment.accepted.v1", nextInvoice, nextPayment, timestamp);
     } else if (
       invoice.status === "provisionally_paid" &&
-      heads.safeBlock !== null &&
-      heads.safeBlock >= payment.blockNumber
+      ((heads.safeBlock !== null && heads.safeBlock >= payment.blockNumber) ||
+        (heads.finalizedBlock !== null && heads.finalizedBlock >= payment.blockNumber))
     ) {
       nextInvoice = { ...invoice, status: "settled", settledAt: timestamp, updatedAt: timestamp };
       nextPayment = { ...payment, phase: "settled", settledAt: timestamp, updatedAt: timestamp };
@@ -773,7 +1358,26 @@ export function createPaymentService(options: PaymentServiceOptions) {
         updatedAt: timestamp,
       };
     } else {
-      if (!headAdvanced(headsEntry.value, heads)) return { invoice: invoiceJson(invoice) };
+      if (!headAdvanced(headsEntry.value, heads)) {
+        reportVerified();
+        return { invoice: invoiceJson(invoice) };
+      }
+    }
+
+    if (nextInvoice === invoice) {
+      // Head movement alone neither replaces the payment generation nor rearms a spent milestone.
+      const atomic = kv
+        .atomic()
+        .check(invoiceEntry, paymentEntry, headsEntry)
+        .set(headKey(invoice.chainId), heads);
+      if (context?.fence) atomic.check(context.fence);
+      if (context && !(await context.isCurrent())) throw new StaleWakeupError();
+      if (!(await atomic.commit()).ok) {
+        if (context) throw new StaleWakeupError();
+        return refreshInvoice(invoice.id, context, undefined, inconclusive, verified);
+      }
+      reportVerified();
+      return { invoice: invoiceJson(invoice) };
     }
 
     const openKey = openInvoiceKey(
@@ -798,8 +1402,12 @@ export function createPaymentService(options: PaymentServiceOptions) {
       atomic = atomic.delete(invoiceByChainKey(invoice.chainId, invoice.id));
     }
     if (event) atomic = addEventMutations(atomic, event);
-    const committed = await atomic.commit();
-    if (!committed.ok) return refreshInvoice(invoice.id);
+    const committed = await commitInvoice(atomic, nextInvoice, event, evidence, context);
+    if (!committed.ok) {
+      if (context) throw new StaleWakeupError();
+      return refreshInvoice(invoice.id, context, undefined, inconclusive, verified);
+    }
+    reportVerified(committed.versionstamp);
     return { invoice: invoiceJson(nextInvoice), eventJws: event?.compactJws };
   }
 
@@ -807,6 +1415,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     invoiceEntry: KvEntryMaybe<InvoiceRecord>,
     paymentEntry: KvEntryMaybe<PaymentRecord>,
     reason: string,
+    context?: ChainTransferContext,
   ): Promise<ClaimPaymentResult> {
     const invoice = invoiceEntry.value!;
     const payment = paymentEntry.value!;
@@ -840,13 +1449,17 @@ export function createPaymentService(options: PaymentServiceOptions) {
         .check(paymentEntry)
         .check(locatorEntry)
         .set(invoiceKey(invoice.id), nextInvoice)
+        .delete(discoveryStateKey(invoice.id))
         .delete(paymentKey(payment.id))
         .delete(locatorKey);
       if (expired && openEntry.value?.invoiceId === invoice.id) {
         atomic = atomic.check(openEntry).delete(openKey);
       }
-      const committed = await atomic.commit();
-      if (!committed.ok) return refreshInvoice(invoice.id);
+      const committed = await commitInvoice(atomic, nextInvoice, undefined, undefined, context);
+      if (!committed.ok) {
+        if (context) throw new StaleWakeupError();
+        return refreshInvoice(invoice.id, context);
+      }
       return { invoice: invoiceJson(nextInvoice) };
     }
 
@@ -877,12 +1490,16 @@ export function createPaymentService(options: PaymentServiceOptions) {
         .check(paymentEntry)
         .set(invoiceKey(invoice.id), nextInvoice)
         .set(paymentKey(payment.id), nextPayment)
+        .delete(discoveryStateKey(invoice.id))
         .set(invoiceByChainKey(invoice.chainId, invoice.id), invoice.id),
       event,
     );
     if (openEntry.value?.invoiceId === invoice.id) atomic = atomic.check(openEntry).delete(openKey);
-    const committed = await atomic.commit();
-    if (!committed.ok) return refreshInvoice(invoice.id);
+    const committed = await commitInvoice(atomic, nextInvoice, event, undefined, context);
+    if (!committed.ok) {
+      if (context) throw new StaleWakeupError();
+      return refreshInvoice(invoice.id, context);
+    }
     return { invoice: invoiceJson(nextInvoice), eventJws: event.compactJws };
   }
 
@@ -904,7 +1521,14 @@ export function createPaymentService(options: PaymentServiceOptions) {
         invoice.chainId,
       );
       const openEntry = await kv.get<OpenInvoiceIndex>(openKey);
-      const nextInvoice = await expireAwaiting(kv, clock, invoiceEntry, openEntry, openKey);
+      const nextInvoice = await expireAwaiting(
+        kv,
+        clock,
+        invoiceEntry,
+        openEntry,
+        openKey,
+        options.wakeups,
+      );
       if (nextInvoice) return invoiceJson(nextInvoice);
     }
   }
@@ -929,7 +1553,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       if (openEntry.value?.invoiceId === invoiceId) {
         atomic = atomic.check(openEntry).delete(openKey);
       }
-      if ((await atomic.commit()).ok) return invoiceJson(next);
+      if ((await commitInvoice(atomic, next)).ok) return invoiceJson(next);
     }
   }
 
@@ -986,19 +1610,31 @@ export function createPaymentService(options: PaymentServiceOptions) {
     } as DeliveryEventRecord;
   }
 
-  async function signedExistingEvent(invoiceId: string): Promise<string | undefined> {
-    const invoice = await invoiceRecord(kv, invoiceId);
+  async function signedExistingEvent(
+    invoice: InvoiceRecord | InvoiceJson,
+  ): Promise<string | undefined> {
+    if (!invoice.paymentId) return undefined;
     const types: PaymentEventType[] =
       invoice.status === "reverted"
         ? ["payment.reverted.v1"]
         : invoice.status === "settled" || invoice.status === "finalized"
           ? ["payment.settled.v1", "payment.accepted.v1"]
-          : ["payment.accepted.v1"];
+          : invoice.status === "provisionally_paid"
+            ? ["payment.accepted.v1"]
+            : [];
     for (const type of types) {
-      const eventId = (await kv.get<string>(eventByInvoiceKey(invoiceId, type))).value;
+      const eventId = (await kv.get<string>(eventByInvoiceKey(invoice.id, type))).value;
       if (!eventId) continue;
       const event = (await kv.get<DeliveryEventRecord>(eventKey(eventId))).value;
-      if (event) return signEventForDelivery(signer, event, clock.now());
+      const occurredAt =
+        type === "payment.reverted.v1"
+          ? invoice.revertedAt
+          : type === "payment.settled.v1"
+            ? invoice.settledAt
+            : invoice.acceptedAt;
+      if (event?.paymentId === invoice.paymentId && event.createdAt === occurredAt) {
+        return signEventForDelivery(signer, event, clock.now());
+      }
     }
     return undefined;
   }
@@ -1064,14 +1700,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
         )
       ).flat();
       for (const log of logs) {
-        const invoice = watch.invoices.find(
-          (candidate) =>
-            (!candidate.paymentId || candidate.status === "reverted") &&
-            candidate.minimumBlock <= log.blockNumber &&
-            candidate.tokenAddress.toLowerCase() === log.tokenAddress.toLowerCase() &&
-            candidate.treasuryAddress.toLowerCase() === log.recipientAddress.toLowerCase() &&
-            candidate.paidAmountUnits === log.amountUnits,
-        );
+        const invoice = watch.invoices.find((candidate) => invoiceMatchesTransfer(candidate, log));
         if (!invoice) continue;
         try {
           await claimPayment(invoice.id, {
@@ -1162,6 +1791,7 @@ export async function markOutboxDelivered(
   kv: Kv,
   eventIdInput: unknown,
   clock: Clock = systemClock,
+  wakeups?: WakeupPort,
 ): Promise<OutboxEventRecord> {
   const eventId = boundedText(eventIdInput, "event_id", 128);
   while (true) {
@@ -1169,14 +1799,16 @@ export async function markOutboxDelivered(
     if (!entry.value) throw new PaymentDomainError("event_not_found");
     if (entry.value.deliveredAt) return entry.value;
     const next = { ...entry.value, deliveredAt: clock.now().toISOString() };
+    const atomic = kv
+      .atomic()
+      .check(entry)
+      .set(eventKey(eventId), next)
+      .delete(outboxKey(entry.value));
     if (
       (
-        await kv
-          .atomic()
-          .check(entry)
-          .set(eventKey(eventId), next)
-          .delete(outboxKey(entry.value))
-          .commit()
+        await (wakeups?.commit(atomic, [
+          { kind: "delivery", id: eventId, dueAt: null, reason: "cancel" },
+        ]) ?? atomic.commit())
       ).ok
     )
       return next;
@@ -1188,6 +1820,7 @@ export async function markOutboxFailed(
   eventIdInput: unknown,
   reason: unknown,
   clock: Clock = systemClock,
+  wakeups?: WakeupPort,
 ): Promise<DeliveryEventRecord> {
   const eventId = boundedText(eventIdInput, "event_id", 128);
   while (true) {
@@ -1207,15 +1840,25 @@ export async function markOutboxFailed(
       lastError: boundedDeliveryError(reason),
       nextAttemptAt: new Date(attemptedAt.getTime() + delay).toISOString(),
     };
-    const committed = await kv
+    const atomic = kv
       .atomic()
       .check(entry)
       .set(eventKey(eventId), next)
       .delete(outboxKey(entry.value))
-      .set(outboxKey(next), eventId)
-      .commit();
+      .set(outboxKey(next), eventId);
+    const committed = await (wakeups?.commit(atomic, [
+      { kind: "delivery", id: eventId, dueAt: Date.parse(next.nextAttemptAt), reason: "delivery" },
+    ]) ?? atomic.commit());
     if (committed.ok) return next;
   }
+}
+
+export async function getOutboxEventRecord(
+  kv: Kv,
+  eventIdInput: unknown,
+): Promise<DeliveryEventRecord | null> {
+  return (await kv.get<DeliveryEventRecord>(eventKey(boundedText(eventIdInput, "event_id", 128))))
+    .value;
 }
 
 export async function invoiceRecord(kv: Kv, invoiceIdInput: unknown): Promise<InvoiceRecord> {
@@ -1267,11 +1910,11 @@ export async function listChainConfigurations(kv: Kv): Promise<PaymentChainConfi
   });
 }
 
-function invoiceKey(invoiceId: string): KvKey {
+export function invoiceKey(invoiceId: string): KvKey {
   return [...INVOICES_PREFIX, invoiceId];
 }
 
-function paymentKey(paymentId: string): KvKey {
+export function paymentKey(paymentId: string): KvKey {
   return [...PAYMENTS_PREFIX, paymentId];
 }
 
@@ -1449,6 +2092,7 @@ async function expireAwaiting(
   invoiceEntry: KvEntryMaybe<InvoiceRecord>,
   openEntry: KvEntryMaybe<OpenInvoiceIndex>,
   openKey: KvKey,
+  wakeups?: WakeupPort,
 ): Promise<InvoiceRecord | null> {
   const invoice = invoiceEntry.value!;
   const timestamp = clock.now().toISOString();
@@ -1462,5 +2106,11 @@ async function expireAwaiting(
   if (openEntry.value?.invoiceId === invoice.id) {
     atomic = atomic.check(openEntry).delete(openKey);
   }
-  return (await atomic.commit()).ok ? next : null;
+  return (
+    await (wakeups?.commit(atomic, [
+      { kind: "invoice", id: invoice.id, dueAt: Date.parse(invoice.expiresAt), reason: "expiry" },
+    ]) ?? atomic.commit())
+  ).ok
+    ? next
+    : null;
 }

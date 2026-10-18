@@ -9,6 +9,7 @@ import {
   type SupportedChainId,
 } from "./payment_types.ts";
 import { chainHeads, discoverTransferLogs, RpcVerificationError } from "./rpc.ts";
+import { invoiceMatchesTransfer } from "./payment_discovery.ts";
 
 const PREFIX = ["uos_checkout", "v1", "payments"];
 const OVERLAP_BLOCKS = 128n;
@@ -69,7 +70,7 @@ export async function reconcileInvoiceBatch(
       toBlock,
     );
     for (const log of logs) {
-      if (log.amountUnits !== invoice.paidAmountUnits) continue;
+      if (!invoiceMatchesTransfer(invoice, log)) continue;
       try {
         await payment.claimPayment(invoice.id, {
           transactionHash: log.transactionHash,

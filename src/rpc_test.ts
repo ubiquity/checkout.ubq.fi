@@ -106,15 +106,87 @@ test("browser block hash is not trusted as canonical evidence", async () => {
   assertEquals(verified.blockHash, BLOCK_HASH);
 });
 
-test("RPC head snapshots require finalized <= safe <= latest", async () => {
-  const incoherent = mockClient((calls) =>
-    batchResponse(calls, { latest: 100n, safe: 101n, finalized: 99n }),
-  );
-  await assertRejectsRpcCode(() => chainHeads(incoherent, 8453), "rpc_incoherent_chain_heads");
+for (const [safe, finalized, expectedSafe, expectedFinalized] of [
+  [101n, 99n, null, 99n],
+  [90n, 99n, null, 99n],
+  [99n, 101n, 99n, null],
+] as const) {
+  test(`invalid optional heads preserve useful essential evidence (${safe}/${finalized})`, async () => {
+    const client = mockClient((calls) => batchResponse(calls, { latest: 100n, safe, finalized }));
+    for (const heads of [
+      await chainHeads(client, 8453),
+      await verifyTransferBatch(client, 8453, expected()),
+    ]) {
+      assertEquals(heads.latestBlock, 100n);
+      assertEquals(heads.safeBlock, expectedSafe);
+      assertEquals(heads.finalizedBlock, expectedFinalized);
+    }
+  });
+}
+
+test("canonical batches retry only failed heads once and retain unordered successes", async () => {
+  const requests: string[][] = [];
+  const client = mockClient((calls) => {
+    requests.push(calls.map(({ id }) => id));
+    if (requests.length === 1)
+      return batchResponse(calls)
+        .reverse()
+        .map((item) =>
+          item.id === "safe"
+            ? { jsonrpc: "2.0", id: "safe", error: { code: -32000, message: "unavailable" } }
+            : item,
+        );
+    return batchResponse(calls, { safe: 102n });
+  });
+  const transfer = await verifyTransferBatch(client, 8453, expected());
+  assertEquals(requests, [["receipt", "event_block", "latest", "safe", "finalized"], ["safe"]]);
+  assertEquals(transfer.blockHash, BLOCK_HASH);
+  assertEquals(transfer.safeBlock, 102n);
+  assertEquals(transfer.finalizedBlock, 99n);
+});
+
+test("missing and failed optional heads get one retry while receipt/latest survive", async () => {
+  let requests = 0;
+  const client = mockClient((calls) => {
+    requests++;
+    return batchResponse(calls).filter((item) => item.id !== "safe" && item.id !== "finalized");
+  });
+  const transfer = await verifyTransferBatch(client, 8453, expected());
+  assertEquals(requests, 2);
+  assertEquals(transfer.blockNumber, 100n);
+  assertEquals(transfer.safeBlock, null);
+  assertEquals(transfer.finalizedBlock, null);
+});
+
+test("malformed and null optional blocks remain unknown without retrying successful entries", async () => {
+  let requests = 0;
+  const client = mockClient((calls) => {
+    requests++;
+    return batchResponse(calls).map((item) =>
+      item.id === "safe"
+        ? { ...item, result: {} }
+        : item.id === "finalized"
+          ? { ...item, result: null }
+          : item,
+    );
+  });
+  const transfer = await verifyTransferBatch(client, 8453, expected());
+  assertEquals(requests, 1);
+  assertEquals(transfer.safeBlock, null);
+  assertEquals(transfer.finalizedBlock, null);
+});
+
+test("essential failures never become successful payment evidence", async () => {
+  let requests = 0;
+  const client = mockClient((calls) => {
+    requests++;
+    return batchResponse(calls).filter((item) => item.id !== "latest");
+  });
   await assertRejectsRpcCode(
-    () => verifyTransferBatch(incoherent, 8453, expected()),
-    "rpc_incoherent_chain_heads",
+    () => verifyTransferBatch(client, 8453, expected()),
+    "rpc_missing_response:latest",
   );
+  assertEquals(requests, 2);
 });
 
 test("reconciliation log discovery is constrained by token and indexed treasury", async () => {

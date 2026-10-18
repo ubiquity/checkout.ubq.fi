@@ -6,6 +6,8 @@ export type KvCheck = { key: KvKey; versionstamp: string | null };
 export type KvCommitResult = { ok: true; versionstamp: string } | { ok: false; versionstamp: null };
 export type KvListSelector = { prefix?: KvKey; start?: KvKey; end?: KvKey };
 export type KvListOptions = { limit?: number; reverse?: boolean };
+export type KvPageOptions = { limit: number; cursor?: string | null };
+export type KvPage<T> = { entries: KvEntry<T>[]; cursor: string | null };
 export type KvEntries<T extends readonly unknown[]> = { [K in keyof T]: KvEntryMaybe<T[K]> };
 
 export interface KvAtomic {
@@ -25,6 +27,8 @@ export interface Kv {
   ): Promise<{ ok: true; versionstamp: string }>;
   delete(key: KvKey): Promise<void>;
   list<T>(selector: KvListSelector, options?: KvListOptions): AsyncIterableIterator<KvEntry<T>>;
+  /** One bounded backend page, with a cursor scoped to this exact prefix. */
+  listPage<T>(prefix: KvKey, options: KvPageOptions): Promise<KvPage<T>>;
   atomic(): KvAtomic;
   close(): void;
 }
