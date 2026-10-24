@@ -301,6 +301,48 @@ test("wallet report preserves its verified fresh event when the account hunt has
   }
 });
 
+test("reverify quarantined inclusion after canonical RPC recovery", async () => {
+  const app = await setup();
+  try {
+    const unpaid = await app.create("unpaid");
+    const log = app.rpc.add(await app.service.getInvoiceRecord(unpaid.id), 200n);
+    app.rpc.latest = 300n;
+    app.rpc.safe = 250n;
+    app.rpc.reorged.add(log.transactionHash);
+    app.rpc.keepReorgedLogs = true;
+
+    const firstHunt = await app.service.discoverPayment(unpaid.id);
+    equal(firstHunt.accountHunt?.pending, true);
+    equal(firstHunt.accountHunt?.reachedHead, false);
+    const unpaidFirst = await app.service.getInvoiceRecord(unpaid.id);
+    equal(unpaidFirst.paymentId, undefined);
+    const quarantined = await app.kv.get<TransferReview>(observationKey(8453, log));
+    equal(quarantined.value?.canonicalContradiction, "non_canonical_block");
+    ok(quarantined.value?.provenance.includes("account_hunt_canonical_contradiction"));
+
+    app.rpc.reorged.delete(log.transactionHash);
+    const later = await app.create("later");
+    const secondHunt = await app.service.discoverPayment(later.id);
+    equal(secondHunt.accountHunt?.pending, false);
+    equal(secondHunt.accountHunt?.reachedHead, true);
+
+    const recovered = await app.service.getInvoiceRecord(unpaid.id);
+    ok(recovered.paymentId);
+    const payment = await app.kv.get<PaymentRecord>([
+      ...prefix,
+      "payment_records",
+      recovered.paymentId,
+    ]);
+    equal(payment.value?.transactionHash, log.transactionHash);
+
+    const historical = await app.kv.get<TransferReview>(observationKey(8453, log));
+    equal(historical.value?.canonicalContradiction, "non_canonical_block");
+    ok(historical.value?.provenance.includes("account_hunt_canonical_contradiction"));
+  } finally {
+    app.kv.close();
+  }
+});
+
 class ReviewRpc extends RuntimeRpc {
   reorged = new Set<string>();
   keepReorgedLogs = false;

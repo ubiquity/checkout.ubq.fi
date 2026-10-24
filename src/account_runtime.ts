@@ -343,6 +343,7 @@ export async function runAccountHunt(options: {
   }
   const release = budget?.reserveForCompletion(5);
   const verifiedThisEvent = new Map<string, KvCheck[]>();
+  const quarantinedThisEvent = new Set<string>();
   let resolutionComplete = true;
   const scoped = (): ChainTransferContext => ({
     budget,
@@ -524,7 +525,7 @@ export async function runAccountHunt(options: {
       if (!(await current())) throw new StaleWakeupError();
       const observed = result.observations[run.offset];
       const inclusion = JSON.stringify(observationKey(observed.chainId, observed.log));
-      if (run.quarantinedInclusions?.includes(inclusion)) {
+      if (quarantinedThisEvent.has(inclusion)) {
         invalidateCoverage(observed);
         run.offset++;
         await save();
@@ -553,18 +554,33 @@ export async function runAccountHunt(options: {
         provenance: "account_hunt",
       });
       if (!attribution.complete) break;
+      if (
+        run.quarantinedInclusions?.includes(inclusion) &&
+        (!eligible || attribution.classification !== "owned")
+      ) {
+        invalidateCoverage(observed);
+        run.offset++;
+        await save();
+        continue;
+      }
       if (eligible && attribution.classification === "owned") {
         if (!room(options.context ? 13 : 8)) break;
         const scope = scoped();
         scope.fences = [...(scope.fences ?? []), ...(attribution.checks ?? [])];
         try {
           await options.claim(invoice!, { ...observed.log }, scope, attribution);
+          if (run.quarantinedInclusions?.includes(inclusion)) {
+            run.quarantinedInclusions = run.quarantinedInclusions.filter(
+              (item) => item !== inclusion,
+            );
+          }
         } catch (error) {
           if (
             !(error instanceof RpcVerificationError) ||
             (!error.canonicalContradiction && error.code !== "non_canonical_block")
           )
             throw error;
+          quarantinedThisEvent.add(inclusion);
           invalidateCoverage(observed);
           if (!room(2)) break;
           const prior = await kv.get<TransferReview>(
