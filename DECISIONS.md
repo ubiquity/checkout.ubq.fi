@@ -1,5 +1,15 @@
 # Checkout decisions
 
+## 2026-11-19: Checkout uses canonical auth.ubq.fi
+
+Checkout's external Auth Hub origin and expected JWT issuer become `https://auth.ubq.fi`. Client `uos-checkout`, audience `uos-checkout`, origin `https://checkout.ubq.fi`, callback `/auth/callback`, PKCE, local membership storage and the existing administrator role contract remain unchanged. The existing owner user ID already matches a Passport administrator account, so no membership remap is required.
+
+The retired `deno-universal-auth.0x4007.deno.net` origin is no longer accepted. `passport.ubq.fi` tokens are not accepted. Existing Checkout admin cookies contain the old issuer and require a fresh sign-in.
+
+Reason: consolidate live Checkout authentication onto the canonical Ubiquity Passport identity.
+
+Reversal risk: rollback requires restoring the previous Checkout Worker and the old auth service together; a partial rollback leaves administrators signed out.
+
 ## 2026-10-18: Bun development and Workers Free production
 
 The application uses pinned Bun 1.4.0 for local development, scripts, demo, tests, and dependency installation. Production uses Cloudflare Workers and its `workerd` runtime. This explicitly replaces the former Deno-only project rule; no Deno runtime, CLI, configuration, or deployment requirement remains. Node 24.20.0 is a narrow exception for Cloudflare's supported Wrangler/Miniflare control plane. The Bun test runner builds and launches that control plane when testing real workerd; application execution stays Bun or workerd.

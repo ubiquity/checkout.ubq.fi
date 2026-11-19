@@ -38,7 +38,7 @@ export type AdminSession = {
   token: string;
 };
 
-export const AUTH_HUB_ORIGIN = "https://deno-universal-auth.0x4007.deno.net";
+export const AUTH_HUB_ORIGIN = "https://auth.ubq.fi";
 export const AUTH_HUB_CLIENT_ID = "uos-checkout";
 export const AUTH_HUB_AUDIENCE = "uos-checkout";
 export const ADMIN_SESSION_COOKIE = "uos_checkout_session";
