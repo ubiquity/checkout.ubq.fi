@@ -105,7 +105,7 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
   }
 
   if (url.pathname === "/api/auth/login" && request.method === "GET") {
-    return services.adminAuth.loginRedirect(request);
+    return await services.adminAuth.loginRedirect(request);
   }
   if (url.pathname === "/auth/callback" && request.method === "GET") {
     return await services.adminAuth.callback(request);

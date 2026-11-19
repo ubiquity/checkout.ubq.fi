@@ -2,7 +2,9 @@
 
 ## 2026-11-19: Checkout uses canonical auth.ubq.fi
 
-Checkout's external Auth Hub origin and expected JWT issuer become `https://auth.ubq.fi`. Client `uos-checkout`, audience `uos-checkout`, origin `https://checkout.ubq.fi`, callback `/auth/callback`, PKCE, local membership storage and the existing administrator role contract remain unchanged. The existing owner user ID already matches a Passport administrator account, so no membership remap is required.
+Checkout's external Auth Hub origin and expected JWT issuer become `https://auth.ubq.fi`. Client `uos-checkout`, audience `uos-checkout`, origin `https://checkout.ubq.fi`, callback `/auth/callback`, local membership storage and the existing administrator role contract remain unchanged. The existing owner user ID already matches a Passport administrator account, so no membership remap is required.
+
+Checkout generates a random 32-byte PKCE verifier for each login, keeps it in the HttpOnly state cookie, sends its S256 challenge to Passport, and returns the verifier during code exchange. Canonical Passport rejects an authorize request without an S256 challenge, so this completes the protocol migration rather than changing the client identity.
 
 The retired `deno-universal-auth.0x4007.deno.net` origin is no longer accepted. `passport.ubq.fi` tokens are not accepted. Existing Checkout admin cookies contain the old issuer and require a fresh sign-in.
 
