@@ -81,12 +81,12 @@ test("the owner can invite an Auth Hub handle that atomically becomes a member",
 });
 
 test("login redirects to the registered Checkout Auth Hub client", async () => {
-  await withKv((kv) => {
+  await withKv(async (kv) => {
     const service = createAdminAuthService(kv, {
       now: () => NOW,
       randomUuid: () => "state-123",
     });
-    const response = service.loginRedirect(
+    const response = await service.loginRedirect(
       new Request("https://checkout.ubq.fi/api/auth/login?returnTo=%2Fsettings"),
     );
     assertEquals(response.status, 302);
@@ -95,7 +95,48 @@ test("login redirects to the registered Checkout Auth Hub client", async () => {
     assertEquals(location.searchParams.get("client_id"), AUTH_HUB_CLIENT_ID);
     assertEquals(location.searchParams.get("audience"), AUTH_HUB_AUDIENCE);
     assertEquals(location.searchParams.get("state"), "state-123");
+    assertEquals(location.searchParams.get("code_challenge_method"), "S256");
+    const challenge = location.searchParams.get("code_challenge") ?? "";
+    assertEquals(/^[A-Za-z0-9_-]{43}$/u.test(challenge), true);
+    const state = JSON.parse(authStateCookie(response));
+    assertEquals(state.state, "state-123");
+    assertEquals(state.returnTo, "/settings");
+    assertEquals(/^[A-Za-z0-9_-]{43}$/u.test(state.codeVerifier), true);
+    assertEquals(
+      base64Url(
+        new Uint8Array(
+          await crypto.subtle.digest("SHA-256", new TextEncoder().encode(state.codeVerifier)),
+        ),
+      ),
+      challenge,
+    );
     assert((response.headers.get("set-cookie") ?? "").includes("HttpOnly"));
+  });
+});
+
+test("callback exchanges the PKCE verifier bound to the login state", async () => {
+  await withKv(async (kv) => {
+    let exchange: Record<string, unknown> = {};
+    const service = createAdminAuthService(kv, {
+      now: () => NOW,
+      fetch: ((_input, init) => {
+        exchange = JSON.parse(String(init?.body));
+        return Promise.resolve(Response.json({ error: "invalid_code" }, { status: 400 }));
+      }) as FetchLike,
+    });
+    const login = await service.loginRedirect(
+      new Request("https://checkout.ubq.fi/api/auth/login"),
+    );
+    const state = JSON.parse(authStateCookie(login));
+    const callback = new Request(
+      `https://checkout.ubq.fi/auth/callback?state=${encodeURIComponent(state.state)}&code=test-code`,
+      {
+        headers: { cookie: `uos_checkout_auth_state=${encodeURIComponent(JSON.stringify(state))}` },
+      },
+    );
+    await assertRejects(() => service.callback(callback), "auth_exchange_failed");
+    assertEquals(exchange.code, "test-code");
+    assertEquals(exchange.codeVerifier, state.codeVerifier);
   });
 });
 
@@ -173,6 +214,14 @@ function sessionRequest(token: string): Request {
   return new Request("https://checkout.ubq.fi/", {
     headers: { cookie: `${ADMIN_SESSION_COOKIE}=${encodeURIComponent(token)}` },
   });
+}
+
+function authStateCookie(response: Response): string {
+  const match = (response.headers.get("set-cookie") ?? "").match(
+    /(?:^|, )uos_checkout_auth_state=([^;]*)/u,
+  );
+  if (!match) throw new Error("Expected auth state cookie");
+  return decodeURIComponent(match[1]);
 }
 
 async function generateSigningKeys() {

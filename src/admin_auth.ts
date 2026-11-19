@@ -155,11 +155,17 @@ export function createAdminAuthService(kv: Kv, options: AdminAuthOptions = {}) {
       if (!roles.includes(session.member.role)) throw new AdminAuthError(403, "forbidden");
       return session;
     },
-    loginRedirect(request: Request): Response {
+    async loginRedirect(request: Request): Promise<Response> {
       if (isTrustedLocalRequest(request)) return redirect(new URL("/", request.url).toString());
       const requestUrl = new URL(request.url);
       assertAllowedOrigin(requestUrl.origin);
       const state = randomUuid();
+      const codeVerifier = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)));
+      const codeChallenge = base64UrlEncode(
+        new Uint8Array(
+          await crypto.subtle.digest("SHA-256", new TextEncoder().encode(codeVerifier)),
+        ),
+      );
       const returnTo = safeReturnTo(requestUrl.searchParams.get("returnTo"), requestUrl.origin);
       const redirectUri = `${requestUrl.origin}${AUTH_CALLBACK_PATH}`;
       const authUrl = new URL("/authorize", AUTH_HUB_ORIGIN);
@@ -168,6 +174,8 @@ export function createAdminAuthService(kv: Kv, options: AdminAuthOptions = {}) {
       authUrl.searchParams.set("origin", requestUrl.origin);
       authUrl.searchParams.set("redirect_uri", redirectUri);
       authUrl.searchParams.set("state", state);
+      authUrl.searchParams.set("code_challenge", codeChallenge);
+      authUrl.searchParams.set("code_challenge_method", "S256");
       return new Response(null, {
         status: 302,
         headers: {
@@ -175,7 +183,7 @@ export function createAdminAuthService(kv: Kv, options: AdminAuthOptions = {}) {
           "set-cookie": serializeCookie(
             request,
             AUTH_STATE_COOKIE,
-            JSON.stringify({ state, returnTo }),
+            JSON.stringify({ state, returnTo, codeVerifier }),
             now() + AUTH_STATE_TTL_MS,
           ),
         },
@@ -202,6 +210,7 @@ export function createAdminAuthService(kv: Kv, options: AdminAuthOptions = {}) {
           audience: AUTH_HUB_AUDIENCE,
           origin: requestUrl.origin,
           redirectUri,
+          codeVerifier: expected.codeVerifier,
         }),
       });
       const body = await responseJson(exchange);
@@ -469,10 +478,17 @@ function normalizeHandle(value: unknown): string {
   return handle;
 }
 
-function readAuthState(request: Request): { state: string; returnTo: string } | null {
+function readAuthState(
+  request: Request,
+): { state: string; returnTo: string; codeVerifier: string } | null {
   try {
     const value = JSON.parse(cookieValue(request, AUTH_STATE_COOKIE));
-    return typeof value?.state === "string" && typeof value?.returnTo === "string" ? value : null;
+    return typeof value?.state === "string" &&
+      typeof value?.returnTo === "string" &&
+      typeof value?.codeVerifier === "string" &&
+      /^[A-Za-z0-9_-]{43}$/u.test(value.codeVerifier)
+      ? value
+      : null;
   } catch {
     return null;
   }
@@ -554,6 +570,12 @@ function decodeBase64Url(value: string): ArrayBuffer {
     value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - (value.length % 4)) % 4);
   const binary = atob(base64);
   return Uint8Array.from(binary, (character) => character.charCodeAt(0)).buffer;
+}
+
+function base64UrlEncode(value: Uint8Array): string {
+  let binary = "";
+  for (const byte of value) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
 async function responseJson(response: Response): Promise<Record<string, unknown>> {
